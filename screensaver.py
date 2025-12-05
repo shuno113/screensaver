@@ -14,18 +14,22 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# 論理解像度（エンコード単位）
-LOGICAL_WIDTH = 480
-LOGICAL_HEIGHT = 270
+# ============================================================
+#  設定値
+# ============================================================
 
-# 各論理ピクセルは 4x4 のブロックとして表示する
-BLOCK_SIZE = 4  # 拡大倍率
+# 論理解像度（データを詰めるグリッド）
+LOGICAL_WIDTH = 960
+LOGICAL_HEIGHT = 540
 
-# 物理解像度（ウィンドウ/フルスクリーン）
-PHYSICAL_WIDTH = LOGICAL_WIDTH * BLOCK_SIZE   # 1920
+# 各論理ピクセルを 2x2 のブロックとして表示する
+BLOCK_SIZE = 2
+
+# 実際の描画解像度（ウィンドウ/フルスクリーン）
+PHYSICAL_WIDTH = LOGICAL_WIDTH * BLOCK_SIZE    # 1920
 PHYSICAL_HEIGHT = LOGICAL_HEIGHT * BLOCK_SIZE  # 1080
 
-# 四隅の予約論理ピクセル（位置合わせマーカー用、常に白）
+# 四隅マーカー（論理座標）
 CORNER_LOGICAL_COORDS = [
     (0, 0),
     (LOGICAL_WIDTH - 1, 0),
@@ -36,16 +40,21 @@ CORNER_LOGICAL_COORDS = [
 # 16色 → 4bit nibble
 NIBBLES_PER_BYTE = 2  # hi, lo
 REPETITIONS = 3       # 各 nibble を3回繰り返す
-LOGICAL_PIXELS_PER_BYTE = NIBBLES_PER_BYTE * REPETITIONS  # 6 論理ピクセルで1バイト
+LOGICAL_PIXELS_PER_BYTE = NIBBLES_PER_BYTE * REPETITIONS  # 6 ピクセルで1バイト
 
 # 1 フレームに使えるデータ用論理ピクセル数
 DATA_PIXELS_PER_FRAME = LOGICAL_WIDTH * LOGICAL_HEIGHT - len(CORNER_LOGICAL_COORDS)
 BYTES_PER_FRAME = DATA_PIXELS_PER_FRAME // LOGICAL_PIXELS_PER_BYTE
 
+# AES / PBKDF2
 PBKDF2_SALT = b"FV-ENC-1"
 PBKDF2_ITERATIONS = 200_000
-PBKDF2_OUTPUT_LEN = 48  # 32 bytes key + 16 bytes IV
+PBKDF2_OUTPUT_LEN = 48  # 32 bytes key, 16 bytes IV
 
+
+# ============================================================
+#  暗号処理
+# ============================================================
 
 def derive_key_iv(password: str) -> Tuple[bytes, bytes]:
     """パスワードから AES-256 キーと IV を導出する。"""
@@ -82,7 +91,7 @@ def build_inner_header(file_path: Path, file_bytes: bytes) -> bytes:
         name = name[:200]
     header[48] = len(name)  # name_len
     header[49:49+len(name)] = name
-    # 残りは 0 埋めのまま
+    # 残りは 0 のまま
     return bytes(header)
 
 
@@ -95,7 +104,7 @@ def build_plaintext_block(file_path: Path) -> bytes:
 
 
 def encrypt_plaintext(plaintext: bytes, password: str) -> bytes:
-    """AES-256-CTR で平文ブロックを暗号化し ciphertext を返す。"""
+    """AES-256-CTR で平文ブロックを暗号化。"""
     key, iv = derive_key_iv(password)
     cipher = Cipher(algorithms.AES(key), modes.CTR(iv), backend=default_backend())
     encryptor = cipher.encryptor()
@@ -103,18 +112,22 @@ def encrypt_plaintext(plaintext: bytes, password: str) -> bytes:
     return ciphertext
 
 
-def nibble_to_gray(nibble: int) -> int:
+# ============================================================
+#  nibble → グレースケール（16レベル）
+# ============================================================
+
+def nibble_to_gray(n: int) -> int:
     """
     0..15 の nibble を 0..255 のグレースケールにマップする。
     16段階の等間隔レベル。
     """
-    nibble = max(0, min(15, nibble))
-    return round(nibble * 255 / 15)
+    n = max(0, min(15, n))
+    return round(n * 255 / 15)
 
 
 class NibbleGenerator:
     """
-    ciphertext から nibble を順番に生成するジェネレータ。
+    ciphertext から nibble を順番に生成する。
     各バイトごとに:
       hi = b >> 4
       lo = b & 0x0F
@@ -123,71 +136,72 @@ class NibbleGenerator:
     """
 
     def __init__(self, ciphertext: bytes, repetitions: int):
-        self.ciphertext = ciphertext
-        self.repetitions = repetitions
-        self.byte_index = 0
-        self.phase = 0  # 0..(2*repetitions - 1)
+        self.ct = ciphertext
+        self.rep = repetitions
+        self.byte_i = 0
+        self.phase = 0  # 0..(2*rep-1)
 
-    def next_nibble(self) -> int:
-        if self.byte_index < len(self.ciphertext):
-            b = self.ciphertext[self.byte_index]
+    def next(self) -> int:
+        if self.byte_i < len(self.ct):
+            b = self.ct[self.byte_i]
             hi = (b >> 4) & 0x0F
             lo = b & 0x0F
-            if self.phase < self.repetitions:
-                nib = hi
-            else:
-                nib = lo
+            nib = hi if self.phase < self.rep else lo
             self.phase += 1
-            if self.phase >= 2 * self.repetitions:
+            if self.phase >= 2 * self.rep:
                 self.phase = 0
-                self.byte_index += 1
+                self.byte_i += 1
             return nib
-        else:
-            # ciphertext を使い切ったあとは 0 nibble（=黒）で埋める
-            return 0
+        # データが尽きたら 0（黒）で埋める
+        return 0
 
 
-def generate_logical_frame_surface(nib_gen: NibbleGenerator) -> pygame.Surface:
+# ============================================================
+#  フレーム生成（論理解像度で生成 → 2x2 拡大）
+# ============================================================
+
+def generate_logical_frame(nib_gen: NibbleGenerator) -> pygame.Surface:
     """
-    1フレーム分の「論理解像度」Surface (480x270) を生成する。
+    1フレーム分の「論理解像度」Surface (960x540) を生成する。
     ここで 4bit nibble → 16段階グレースケールに変換し、
     四隅以外の論理ピクセルを塗る。
     """
-    surface = pygame.Surface((LOGICAL_WIDTH, LOGICAL_HEIGHT))
-    surface.lock()
+    surf = pygame.Surface((LOGICAL_WIDTH, LOGICAL_HEIGHT))
+    surf.lock()
 
     for y in range(LOGICAL_HEIGHT):
         for x in range(LOGICAL_WIDTH):
             if (x, y) in CORNER_LOGICAL_COORDS:
-                # corner は後で白にする
                 continue
-            nib = nib_gen.next_nibble()
+            nib = nib_gen.next()
             gray = nibble_to_gray(nib)
-            surface.set_at((x, y), (gray, gray, gray))
+            surf.set_at((x, y), (gray, gray, gray))
 
     # 四隅を白で上書き（位置合わせマーカー）
     for (cx, cy) in CORNER_LOGICAL_COORDS:
-        surface.set_at((cx, cy), (255, 255, 255))
+        surf.set_at((cx, cy), (255, 255, 255))
 
-    surface.unlock()
-    return surface
+    surf.unlock()
+    return surf
 
 
-def make_window_always_on_top():
+# ============================================================
+#  最前面化（Windows 用）
+# ============================================================
+
+def make_window_topmost():
     """
-    Pygame ウィンドウを OS 側で「最前面」にする。
-    - Windows: WinAPI SetWindowPos(HWND_TOPMOST) を使用
-    - 他OS: 一般的にサポートされないので何もしない（フルスクリーン + フォーカスに依存）
+    Windows の場合、WinAPI でウィンドウを TOPMOST にする。
+    他 OS ではフルスクリーン + フォーカスに依存。
     """
-    system = platform.system()
-    if system == "Windows":
+    if platform.system() == "Windows":
         try:
             hwnd = pygame.display.get_wm_info().get("window")
             if hwnd:
                 user32 = ctypes.windll.user32
+                HWND_TOPMOST = -1
                 SWP_NOSIZE = 0x0001
                 SWP_NOMOVE = 0x0002
-                HWND_TOPMOST = -1
                 user32.SetWindowPos(
                     hwnd,
                     HWND_TOPMOST,
@@ -195,96 +209,79 @@ def make_window_always_on_top():
                     SWP_NOMOVE | SWP_NOSIZE,
                 )
         except Exception as e:
-            print(f"[!] Failed to set TOPMOST on Windows: {e}")
-    else:
-        # macOS / Linux では、ウィンドウマネージャ依存で汎用的な always-on-top は難しい。
-        # フルスクリーン + アプリにフォーカスを当てることで実質最前面になる想定。
-        pass
+            print("[!] TOPMOST failed:", e)
 
 
-def run_fullscreen_playback(ciphertext: bytes, fps: int) -> None:
-    """
-    ciphertext をフレーム列にマッピングし、
-    フルスクリーンで順次表示して終了する。
-    """
+# ============================================================
+#  フルスクリーン再生
+# ============================================================
+
+def playback(ciphertext: bytes, fps: int):
     if BYTES_PER_FRAME <= 0:
         raise ValueError("BYTES_PER_FRAME must be positive")
 
     total_bytes = len(ciphertext)
     frame_count = math.ceil(total_bytes / BYTES_PER_FRAME)
 
-    print(f"[+] Fullscreen playback: {frame_count} frames at {fps} fps")
+    print(f"[+] frames={frame_count}, fps={fps}, bytes/frame={BYTES_PER_FRAME}")
 
-    # pygame 初期化
     pygame.init()
-    # フルスクリーン & ダブルバッファ
+    # フルスクリーン 1920x1080（物理解像度）
     screen = pygame.display.set_mode(
         (PHYSICAL_WIDTH, PHYSICAL_HEIGHT),
         pygame.FULLSCREEN | pygame.DOUBLEBUF
     )
-    pygame.display.set_caption("Encrypted Stream Encoder")
-    pygame.mouse.set_visible(False)  # マウスカーソル非表示
+    pygame.display.set_caption("Encrypted Visual Stream (960x540 logical, 2x2 blocks)")
+    pygame.mouse.set_visible(False)
 
-    # ここで OS ごとに可能な範囲で「最前面」にする
-    make_window_always_on_top()
+    make_window_topmost()
 
     clock = pygame.time.Clock()
-    nib_gen = NibbleGenerator(ciphertext, REPETITIONS)
+    nib = NibbleGenerator(ciphertext, REPETITIONS)
 
     running = True
-    for frame_index in range(frame_count):
-        # イベント処理（ESC で中断可能）
+    for fi in range(frame_count):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    running = False
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                running = False
 
         if not running:
             break
 
-        # 1フレーム分の論理 Surface を生成
-        logical_surf = generate_logical_frame_surface(nib_gen)
-        # 物理解像度に拡大（最近傍補間）
-        scaled_surf = pygame.transform.scale(
-            logical_surf, (PHYSICAL_WIDTH, PHYSICAL_HEIGHT)
-        )
+        # 論理解像度でフレーム生成
+        logical = generate_logical_frame(nib)
+        # 2x2 拡大 → 1920x1080 で描画
+        scaled = pygame.transform.scale(logical, (PHYSICAL_WIDTH, PHYSICAL_HEIGHT))
 
-        # 描画
-        screen.blit(scaled_surf, (0, 0))
+        screen.blit(scaled, (0, 0))
         pygame.display.flip()
 
-        # fps 制御
         clock.tick(fps)
 
-    # 少し待ってから終了
-    pygame.time.wait(300)
+    pygame.time.wait(500)
     pygame.quit()
 
 
-def main() -> None:
+# ============================================================
+#  main
+# ============================================================
+
+def main():
     parser = argparse.ArgumentParser(
-        description=(
-            "Encode a file into an encrypted fullscreen visual stream "
-            "(1920x1080, 4x4 blocks, 16-level grayscale, repeated nibbles)."
-        )
+        description="Fullscreen encoder (960x540 logical, 2x2 blocks, 16-level grayscale, repeated nibbles)."
     )
     parser.add_argument("-i", "--input", required=True, help="Input file path")
     parser.add_argument("-p", "--password", help="Password (if omitted, prompt securely)")
-    parser.add_argument(
-        "--fps", type=int, default=10,
-        help="Frames per second for playback (default: 10)"
-    )
+    parser.add_argument("--fps", type=int, default=10, help="Frames per second (default: 10)")
     args = parser.parse_args()
 
     input_path = Path(args.input)
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    password = args.password
-    if password is None:
-        password = getpass.getpass("Password: ")
+    password = args.password or getpass.getpass("Password: ")
 
     print(f"[+] Building plaintext block from {input_path} ...")
     plaintext = build_plaintext_block(input_path)
@@ -294,9 +291,7 @@ def main() -> None:
     ciphertext = encrypt_plaintext(plaintext, password)
     print(f"    Ciphertext size: {len(ciphertext)} bytes")
 
-    # フルスクリーン連続表示
-    run_fullscreen_playback(ciphertext, args.fps)
-
+    playback(ciphertext, args.fps)
     print("[+] Playback finished. Exiting.")
 
 
