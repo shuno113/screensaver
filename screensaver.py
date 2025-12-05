@@ -8,24 +8,26 @@ import ctypes
 from pathlib import Path
 from typing import Tuple
 
+import numpy as np
 import pygame
+import pygame.surfarray as surfarray
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 # ============================================================
-#  設定値
+#  基本設定
 # ============================================================
 
-# 論理解像度（データを詰めるグリッド）
+# 論理解像度（データ格納用グリッド）
 LOGICAL_WIDTH = 960
 LOGICAL_HEIGHT = 540
 
-# 各論理ピクセルを 2x2 のブロックとして表示する
+# 各論理ピクセルを 2x2 のブロックとして表示
 BLOCK_SIZE = 2
 
-# 実際の描画解像度（ウィンドウ/フルスクリーン）
+# 実際の描画解像度（フルスクリーン）
 PHYSICAL_WIDTH = LOGICAL_WIDTH * BLOCK_SIZE    # 1920
 PHYSICAL_HEIGHT = LOGICAL_HEIGHT * BLOCK_SIZE  # 1080
 
@@ -39,12 +41,13 @@ CORNER_LOGICAL_COORDS = [
 
 # 16色 → 4bit nibble
 NIBBLES_PER_BYTE = 2  # hi, lo
-REPETITIONS = 3       # 各 nibble を3回繰り返す
-LOGICAL_PIXELS_PER_BYTE = NIBBLES_PER_BYTE * REPETITIONS  # 6 ピクセルで1バイト
+REPETITIONS = 2       # ★ 3→2 に変更：各 nibble を2回繰り返す
+LOGICAL_PIXELS_PER_BYTE = NIBBLES_PER_BYTE * REPETITIONS  # 4 論理ピクセルで1バイト
 
 # 1 フレームに使えるデータ用論理ピクセル数
-DATA_PIXELS_PER_FRAME = LOGICAL_WIDTH * LOGICAL_HEIGHT - len(CORNER_LOGICAL_COORDS)
-BYTES_PER_FRAME = DATA_PIXELS_PER_FRAME // LOGICAL_PIXELS_PER_BYTE
+TOTAL_LOGICAL_PIXELS = LOGICAL_WIDTH * LOGICAL_HEIGHT
+DATA_PIXELS_PER_FRAME = TOTAL_LOGICAL_PIXELS - len(CORNER_LOGICAL_COORDS)
+BYTES_PER_FRAME = DATA_PIXELS_PER_FRAME // LOGICAL_PIXELS_PER_BYTE  # 1フレームで運べるバイト数
 
 # AES / PBKDF2
 PBKDF2_SALT = b"FV-ENC-1"
@@ -113,76 +116,91 @@ def encrypt_plaintext(plaintext: bytes, password: str) -> bytes:
 
 
 # ============================================================
-#  nibble → グレースケール（16レベル）
+#  nibble 生成とグレースケール変換
 # ============================================================
 
-def nibble_to_gray(n: int) -> int:
+def nibbles_from_bytes(ciphertext: bytes) -> np.ndarray:
     """
-    0..15 の nibble を 0..255 のグレースケールにマップする。
-    16段階の等間隔レベル。
+    ciphertext (uint8) から hi/lo nibble を取り出し、
+    hi, lo を REPETITIONS 回ずつ繰り返した nibble 配列を返す。
+    例: REPETITIONS=2 の場合、1 byte→[hi,hi,lo,lo]（4 nibbles）。
     """
-    n = max(0, min(15, n))
-    return round(n * 255 / 15)
+    ct = np.frombuffer(ciphertext, dtype=np.uint8)
+    hi = (ct >> 4) & 0x0F
+    lo = ct & 0x0F
+
+    # shape: (len(ct), REPETITIONS) に並べて平坦化
+    hi_rep = np.repeat(hi[:, None], REPETITIONS, axis=1)  # (N, REP)
+    lo_rep = np.repeat(lo[:, None], REPETITIONS, axis=1)  # (N, REP)
+
+    # 例: REP=2 の場合、[hi,hi,lo,lo]
+    nibbles = np.concatenate([hi_rep, lo_rep], axis=1).reshape(-1)
+    return nibbles.astype(np.uint8)
 
 
-class NibbleGenerator:
+def nibbles_to_gray(nibbles: np.ndarray) -> np.ndarray:
     """
-    ciphertext から nibble を順番に生成する。
-    各バイトごとに:
-      hi = b >> 4
-      lo = b & 0x0F
-    hi を REPETITIONS 回、lo を REPETITIONS 回返す。
-    ciphertext を使い切ったら 0 nibble を返し続ける。
+    nibble(0..15) の配列を 0..255 グレースケール配列に変換する。
+    gray = round(n * 255 / 15)
     """
-
-    def __init__(self, ciphertext: bytes, repetitions: int):
-        self.ct = ciphertext
-        self.rep = repetitions
-        self.byte_i = 0
-        self.phase = 0  # 0..(2*rep-1)
-
-    def next(self) -> int:
-        if self.byte_i < len(self.ct):
-            b = self.ct[self.byte_i]
-            hi = (b >> 4) & 0x0F
-            lo = b & 0x0F
-            nib = hi if self.phase < self.rep else lo
-            self.phase += 1
-            if self.phase >= 2 * self.rep:
-                self.phase = 0
-                self.byte_i += 1
-            return nib
-        # データが尽きたら 0（黒）で埋める
-        return 0
+    n = nibbles.astype(np.float32)
+    gray = np.round(n * (255.0 / 15.0)).astype(np.uint8)
+    return gray
 
 
 # ============================================================
-#  フレーム生成（論理解像度で生成 → 2x2 拡大）
+#  フレーム生成（numpyベース）
 # ============================================================
 
-def generate_logical_frame(nib_gen: NibbleGenerator) -> pygame.Surface:
+def precompute_data_indices() -> Tuple[np.ndarray, np.ndarray]:
     """
-    1フレーム分の「論理解像度」Surface (960x540) を生成する。
-    ここで 4bit nibble → 16段階グレースケールに変換し、
-    四隅以外の論理ピクセルを塗る。
+    全論理ピクセルのフラットインデックスを作り、
+    四隅を除いた「データ格納用インデックス」と、
+    四隅のインデックスを返す。
     """
-    surf = pygame.Surface((LOGICAL_WIDTH, LOGICAL_HEIGHT))
-    surf.lock()
+    h, w = LOGICAL_HEIGHT, LOGICAL_WIDTH
+    total = h * w
+    all_indices = np.arange(total, dtype=np.int32)
 
-    for y in range(LOGICAL_HEIGHT):
-        for x in range(LOGICAL_WIDTH):
-            if (x, y) in CORNER_LOGICAL_COORDS:
-                continue
-            nib = nib_gen.next()
-            gray = nibble_to_gray(nib)
-            surf.set_at((x, y), (gray, gray, gray))
-
-    # 四隅を白で上書き（位置合わせマーカー）
+    # corner のフラットインデックスを計算
+    corner_indices = []
     for (cx, cy) in CORNER_LOGICAL_COORDS:
-        surf.set_at((cx, cy), (255, 255, 255))
+        idx = cy * LOGICAL_WIDTH + cx
+        corner_indices.append(idx)
+    corner_indices = np.array(corner_indices, dtype=np.int32)
 
-    surf.unlock()
-    return surf
+    # データ用インデックス: corner 以外
+    mask = np.ones(total, dtype=bool)
+    mask[corner_indices] = False
+    data_indices = all_indices[mask]
+
+    return data_indices, corner_indices
+
+
+def generate_frame_array(gray_stream: np.ndarray,
+                         offset: int,
+                         data_indices: np.ndarray,
+                         corner_indices: np.ndarray) -> Tuple[np.ndarray, int]:
+    """
+    gray_stream から offset 以降の値を使い、
+    1フレーム分の論理解像度グレースケール画像 (H,W) を numpy で生成する。
+    戻り値: (frame_gray(H,W), new_offset)
+    """
+    h, w = LOGICAL_HEIGHT, LOGICAL_WIDTH
+    total_pixels = h * w
+
+    # このフレームで使う data ピクセル数
+    need = min(DATA_PIXELS_PER_FRAME, len(gray_stream) - offset)
+    # フレーム全体は 0 (黒) で初期化
+    frame_flat = np.zeros(total_pixels, dtype=np.uint8)
+
+    if need > 0:
+        frame_flat[data_indices[:need]] = gray_stream[offset: offset + need]
+    # 四隅は白(255)にしてマーカー
+    frame_flat[corner_indices] = 255
+
+    frame_gray = frame_flat.reshape(h, w)
+    return frame_gray, offset + need
 
 
 # ============================================================
@@ -190,10 +208,7 @@ def generate_logical_frame(nib_gen: NibbleGenerator) -> pygame.Surface:
 # ============================================================
 
 def make_window_topmost():
-    """
-    Windows の場合、WinAPI でウィンドウを TOPMOST にする。
-    他 OS ではフルスクリーン + フォーカスに依存。
-    """
+    """Windows の場合、WinAPI でウィンドウを TOPMOST にする。"""
     if platform.system() == "Windows":
         try:
             hwnd = pygame.display.get_wm_info().get("window")
@@ -222,24 +237,31 @@ def playback(ciphertext: bytes, fps: int):
 
     total_bytes = len(ciphertext)
     frame_count = math.ceil(total_bytes / BYTES_PER_FRAME)
+    print(f"[+] bytes={total_bytes}, bytes/frame={BYTES_PER_FRAME}, frames={frame_count}, fps={fps}")
 
-    print(f"[+] frames={frame_count}, fps={fps}, bytes/frame={BYTES_PER_FRAME}")
+    # ciphertext → nibble配列 → グレースケール配列
+    nibbles = nibbles_from_bytes(ciphertext)
+    gray_stream = nibbles_to_gray(nibbles)
+    print(f"[+] nibbles={len(nibbles)}, gray_stream={len(gray_stream)}")
+
+    # データ位置と corner 位置を事前計算
+    data_indices, corner_indices = precompute_data_indices()
 
     pygame.init()
-    # フルスクリーン 1920x1080（物理解像度）
     screen = pygame.display.set_mode(
         (PHYSICAL_WIDTH, PHYSICAL_HEIGHT),
         pygame.FULLSCREEN | pygame.DOUBLEBUF
     )
-    pygame.display.set_caption("Encrypted Visual Stream (960x540 logical, 2x2 blocks)")
+    pygame.display.set_caption("Encrypted Visual Stream (960x540 logical, 2x2 blocks, REP=2)")
     pygame.mouse.set_visible(False)
 
     make_window_topmost()
 
     clock = pygame.time.Clock()
-    nib = NibbleGenerator(ciphertext, REPETITIONS)
 
+    offset = 0  # gray_stream の読み出し位置
     running = True
+
     for fi in range(frame_count):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -250,17 +272,23 @@ def playback(ciphertext: bytes, fps: int):
         if not running:
             break
 
-        # 論理解像度でフレーム生成
-        logical = generate_logical_frame(nib)
-        # 2x2 拡大 → 1920x1080 で描画
-        scaled = pygame.transform.scale(logical, (PHYSICAL_WIDTH, PHYSICAL_HEIGHT))
+        # 1フレーム分のグレースケール画像を生成
+        frame_gray, offset = generate_frame_array(gray_stream, offset, data_indices, corner_indices)
+        # (H,W) → (H,W,3) RGB
+        frame_rgb = np.stack([frame_gray]*3, axis=-1)
 
+        # numpy → pygame.Surface
+        # surfarray.make_surface は (W,H,3) 形式を期待するので転置
+        surface = surfarray.make_surface(frame_rgb.swapaxes(0, 1))
+
+        # そのまま表示（論理 960x540 を 2x2 → 1920x1080 に拡大）
+        scaled = pygame.transform.scale(surface, (PHYSICAL_WIDTH, PHYSICAL_HEIGHT))
         screen.blit(scaled, (0, 0))
         pygame.display.flip()
 
         clock.tick(fps)
 
-    pygame.time.wait(500)
+    pygame.time.wait(300)
     pygame.quit()
 
 
@@ -270,7 +298,7 @@ def playback(ciphertext: bytes, fps: int):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fullscreen encoder (960x540 logical, 2x2 blocks, 16-level grayscale, repeated nibbles)."
+        description="Fullscreen encoder (960x540 logical, 2x2 blocks, 16-level grayscale, REPETITIONS=2, numpy-optimized)."
     )
     parser.add_argument("-i", "--input", required=True, help="Input file path")
     parser.add_argument("-p", "--password", help="Password (if omitted, prompt securely)")
