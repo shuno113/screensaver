@@ -3,6 +3,8 @@ import argparse
 import getpass
 import hashlib
 import math
+import platform
+import ctypes
 from pathlib import Path
 from typing import Tuple
 
@@ -16,7 +18,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 LOGICAL_WIDTH = 480
 LOGICAL_HEIGHT = 270
 
-# 各論理ピクセルは 4x4 のブロックとして表示する想定
+# 各論理ピクセルは 4x4 のブロックとして表示する
 BLOCK_SIZE = 4  # 拡大倍率
 
 # 物理解像度（ウィンドウ/フルスクリーン）
@@ -145,8 +147,7 @@ class NibbleGenerator:
             return 0
 
 
-def generate_logical_frame_surface(ciphertext: bytes,
-                                   nib_gen: NibbleGenerator) -> pygame.Surface:
+def generate_logical_frame_surface(nib_gen: NibbleGenerator) -> pygame.Surface:
     """
     1フレーム分の「論理解像度」Surface (480x270) を生成する。
     ここで 4bit nibble → 16段階グレースケールに変換し、
@@ -158,8 +159,7 @@ def generate_logical_frame_surface(ciphertext: bytes,
     for y in range(LOGICAL_HEIGHT):
         for x in range(LOGICAL_WIDTH):
             if (x, y) in CORNER_LOGICAL_COORDS:
-                # corner は後でまとめて白にするので一旦スキップしてもよいが、
-                # ここで直接白を書いてもよい
+                # corner は後で白にする
                 continue
             nib = nib_gen.next_nibble()
             gray = nibble_to_gray(nib)
@@ -171,6 +171,35 @@ def generate_logical_frame_surface(ciphertext: bytes,
 
     surface.unlock()
     return surface
+
+
+def make_window_always_on_top():
+    """
+    Pygame ウィンドウを OS 側で「最前面」にする。
+    - Windows: WinAPI SetWindowPos(HWND_TOPMOST) を使用
+    - 他OS: 一般的にサポートされないので何もしない（フルスクリーン + フォーカスに依存）
+    """
+    system = platform.system()
+    if system == "Windows":
+        try:
+            hwnd = pygame.display.get_wm_info().get("window")
+            if hwnd:
+                user32 = ctypes.windll.user32
+                SWP_NOSIZE = 0x0001
+                SWP_NOMOVE = 0x0002
+                HWND_TOPMOST = -1
+                user32.SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE,
+                )
+        except Exception as e:
+            print(f"[!] Failed to set TOPMOST on Windows: {e}")
+    else:
+        # macOS / Linux では、ウィンドウマネージャ依存で汎用的な always-on-top は難しい。
+        # フルスクリーン + アプリにフォーカスを当てることで実質最前面になる想定。
+        pass
 
 
 def run_fullscreen_playback(ciphertext: bytes, fps: int) -> None:
@@ -196,6 +225,9 @@ def run_fullscreen_playback(ciphertext: bytes, fps: int) -> None:
     pygame.display.set_caption("Encrypted Stream Encoder")
     pygame.mouse.set_visible(False)  # マウスカーソル非表示
 
+    # ここで OS ごとに可能な範囲で「最前面」にする
+    make_window_always_on_top()
+
     clock = pygame.time.Clock()
     nib_gen = NibbleGenerator(ciphertext, REPETITIONS)
 
@@ -213,7 +245,7 @@ def run_fullscreen_playback(ciphertext: bytes, fps: int) -> None:
             break
 
         # 1フレーム分の論理 Surface を生成
-        logical_surf = generate_logical_frame_surface(ciphertext, nib_gen)
+        logical_surf = generate_logical_frame_surface(nib_gen)
         # 物理解像度に拡大（最近傍補間）
         scaled_surf = pygame.transform.scale(
             logical_surf, (PHYSICAL_WIDTH, PHYSICAL_HEIGHT)
