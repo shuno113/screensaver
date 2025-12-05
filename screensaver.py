@@ -3,14 +3,13 @@ import argparse
 import getpass
 import hashlib
 import math
-import platform
-import ctypes
 from pathlib import Path
 from typing import Tuple
 
 import numpy as np
-import pygame
-import pygame.surfarray as surfarray
+import tkinter as tk
+from PIL import Image, ImageTk
+
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -24,10 +23,8 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 LOGICAL_WIDTH = 960
 LOGICAL_HEIGHT = 540
 
-# 各論理ピクセルを 2x2 のブロックとして表示
+# 各論理ピクセルを 2x2 のブロックとして表示 → 物理解像度 1920x1080
 BLOCK_SIZE = 2
-
-# 実際の描画解像度（フルスクリーン）
 PHYSICAL_WIDTH = LOGICAL_WIDTH * BLOCK_SIZE    # 1920
 PHYSICAL_HEIGHT = LOGICAL_HEIGHT * BLOCK_SIZE  # 1080
 
@@ -41,13 +38,13 @@ CORNER_LOGICAL_COORDS = [
 
 # 16色 → 4bit nibble
 NIBBLES_PER_BYTE = 2  # hi, lo
-REPETITIONS = 2       # ★ 3→2 に変更：各 nibble を2回繰り返す
+REPETITIONS = 2       # ★ nibble を2回ずつ繰り返す（高速化のため冗長度を減らした）
 LOGICAL_PIXELS_PER_BYTE = NIBBLES_PER_BYTE * REPETITIONS  # 4 論理ピクセルで1バイト
 
 # 1 フレームに使えるデータ用論理ピクセル数
 TOTAL_LOGICAL_PIXELS = LOGICAL_WIDTH * LOGICAL_HEIGHT
 DATA_PIXELS_PER_FRAME = TOTAL_LOGICAL_PIXELS - len(CORNER_LOGICAL_COORDS)
-BYTES_PER_FRAME = DATA_PIXELS_PER_FRAME // LOGICAL_PIXELS_PER_BYTE  # 1フレームで運べるバイト数
+BYTES_PER_FRAME = DATA_PIXELS_PER_FRAME // LOGICAL_PIXELS_PER_BYTE
 
 # AES / PBKDF2
 PBKDF2_SALT = b"FV-ENC-1"
@@ -116,24 +113,22 @@ def encrypt_plaintext(plaintext: bytes, password: str) -> bytes:
 
 
 # ============================================================
-#  nibble 生成とグレースケール変換
+#  nibble 生成 & グレースケール変換（numpy）
 # ============================================================
 
 def nibbles_from_bytes(ciphertext: bytes) -> np.ndarray:
     """
     ciphertext (uint8) から hi/lo nibble を取り出し、
     hi, lo を REPETITIONS 回ずつ繰り返した nibble 配列を返す。
-    例: REPETITIONS=2 の場合、1 byte→[hi,hi,lo,lo]（4 nibbles）。
+    REPETITIONS=2 の場合、1 byte→[hi,hi,lo,lo]（4 nibbles）。
     """
     ct = np.frombuffer(ciphertext, dtype=np.uint8)
     hi = (ct >> 4) & 0x0F
     lo = ct & 0x0F
 
-    # shape: (len(ct), REPETITIONS) に並べて平坦化
     hi_rep = np.repeat(hi[:, None], REPETITIONS, axis=1)  # (N, REP)
     lo_rep = np.repeat(lo[:, None], REPETITIONS, axis=1)  # (N, REP)
 
-    # 例: REP=2 の場合、[hi,hi,lo,lo]
     nibbles = np.concatenate([hi_rep, lo_rep], axis=1).reshape(-1)
     return nibbles.astype(np.uint8)
 
@@ -162,14 +157,12 @@ def precompute_data_indices() -> Tuple[np.ndarray, np.ndarray]:
     total = h * w
     all_indices = np.arange(total, dtype=np.int32)
 
-    # corner のフラットインデックスを計算
     corner_indices = []
     for (cx, cy) in CORNER_LOGICAL_COORDS:
         idx = cy * LOGICAL_WIDTH + cx
         corner_indices.append(idx)
     corner_indices = np.array(corner_indices, dtype=np.int32)
 
-    # データ用インデックス: corner 以外
     mask = np.ones(total, dtype=bool)
     mask[corner_indices] = False
     data_indices = all_indices[mask]
@@ -190,12 +183,14 @@ def generate_frame_array(gray_stream: np.ndarray,
     total_pixels = h * w
 
     # このフレームで使う data ピクセル数
-    need = min(DATA_PIXELS_PER_FRAME, len(gray_stream) - offset)
-    # フレーム全体は 0 (黒) で初期化
+    remain = len(gray_stream) - offset
+    need = min(DATA_PIXELS_PER_FRAME, remain) if remain > 0 else 0
+
     frame_flat = np.zeros(total_pixels, dtype=np.uint8)
 
     if need > 0:
         frame_flat[data_indices[:need]] = gray_stream[offset: offset + need]
+
     # 四隅は白(255)にしてマーカー
     frame_flat[corner_indices] = 255
 
@@ -204,106 +199,86 @@ def generate_frame_array(gray_stream: np.ndarray,
 
 
 # ============================================================
-#  最前面化（Windows 用）
+#  Tkinter フルスクリーンアプリ
 # ============================================================
 
-def make_window_topmost():
-    """Windows の場合、WinAPI でウィンドウを TOPMOST にする。"""
-    if platform.system() == "Windows":
-        try:
-            hwnd = pygame.display.get_wm_info().get("window")
-            if hwnd:
-                user32 = ctypes.windll.user32
-                HWND_TOPMOST = -1
-                SWP_NOSIZE = 0x0001
-                SWP_NOMOVE = 0x0002
-                user32.SetWindowPos(
-                    hwnd,
-                    HWND_TOPMOST,
-                    0, 0, 0, 0,
-                    SWP_NOMOVE | SWP_NOSIZE,
-                )
-        except Exception as e:
-            print("[!] TOPMOST failed:", e)
+class EncoderApp:
+    def __init__(self, ciphertext: bytes, fps: int):
+        self.ciphertext = ciphertext
+        self.fps = fps
+        self.interval_ms = int(1000 / fps)
 
+        # 前処理：ciphertext → gray_stream
+        nibbles = nibbles_from_bytes(ciphertext)
+        self.gray_stream = nibbles_to_gray(nibbles)
 
-# ============================================================
-#  フルスクリーン再生
-# ============================================================
+        self.data_indices, self.corner_indices = precompute_data_indices()
 
-def playback(ciphertext: bytes, fps: int):
-    if BYTES_PER_FRAME <= 0:
-        raise ValueError("BYTES_PER_FRAME must be positive")
+        total_bytes = len(ciphertext)
+        self.frame_count = math.ceil(total_bytes / BYTES_PER_FRAME)
+        print(f"[+] bytes={total_bytes}, bytes/frame={BYTES_PER_FRAME}, frames={self.frame_count}, fps={self.fps}")
+        print(f"[+] nibbles={len(nibbles)}, gray_stream={len(self.gray_stream)}")
 
-    total_bytes = len(ciphertext)
-    frame_count = math.ceil(total_bytes / BYTES_PER_FRAME)
-    print(f"[+] bytes={total_bytes}, bytes/frame={BYTES_PER_FRAME}, frames={frame_count}, fps={fps}")
+        self.offset = 0
+        self.current_frame = 0
 
-    # ciphertext → nibble配列 → グレースケール配列
-    nibbles = nibbles_from_bytes(ciphertext)
-    gray_stream = nibbles_to_gray(nibbles)
-    print(f"[+] nibbles={len(nibbles)}, gray_stream={len(gray_stream)}")
+        # Tkinter セットアップ
+        self.root = tk.Tk()
+        self.root.title("Encrypted Visual Stream (Tkinter, 960x540 logical, 2x2 blocks, REP=2)")
 
-    # データ位置と corner 位置を事前計算
-    data_indices, corner_indices = precompute_data_indices()
+        # フルスクリーン & 最前面
+        self.root.attributes("-fullscreen", True)
+        self.root.attributes("-topmost", True)
 
-    pygame.init()
-    screen = pygame.display.set_mode(
-        (PHYSICAL_WIDTH, PHYSICAL_HEIGHT),
-        pygame.FULLSCREEN | pygame.DOUBLEBUF
-    )
-    pygame.display.set_caption("Encrypted Visual Stream (960x540 logical, 2x2 blocks, REP=2)")
-    pygame.mouse.set_visible(False)
+        # ESC で終了
+        self.root.bind("<Escape>", lambda e: self.root.destroy())
 
-    try:
-        hwnd = pygame.display.get_wm_info().get("window")
-        if hwnd:
-            user32 = ctypes.windll.user32
-            HWND_TOPMOST = -1
-            SWP_NOSIZE = 0x0001
-            SWP_NOMOVE = 0x0002
-            user32.SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE,
-            )
-    except Exception as e:
-        print("[!] TOPMOST failed:", e)
+        # 画面解像度に合わせてスケーリング
+        self.screen_w = self.root.winfo_screenwidth()
+        self.screen_h = self.root.winfo_screenheight()
 
-    clock = pygame.time.Clock()
+        # 画像表示用ラベル
+        self.label = tk.Label(self.root, bg="black")
+        self.label.pack(fill="both", expand=True)
 
-    offset = 0  # gray_stream の読み出し位置
-    running = True
+        self.photo = None  # 参照保持用
 
-    for fi in range(frame_count):
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                running = False
+        # 最初のフレームをスケジュール
+        self.root.after(0, self.show_next_frame)
 
-        if not running:
-            break
+    def show_next_frame(self):
+        if self.current_frame >= self.frame_count:
+            # 少し待ってから終了
+            self.root.after(500, self.root.destroy)
+            return
 
-        # 1フレーム分のグレースケール画像を生成
-        frame_gray, offset = generate_frame_array(gray_stream, offset, data_indices, corner_indices)
+        # 1フレーム分のグレースケール論理画像を生成
+        frame_gray, self.offset = generate_frame_array(
+            self.gray_stream, self.offset, self.data_indices, self.corner_indices
+        )
+
         # (H,W) → (H,W,3) RGB
-        frame_rgb = np.stack([frame_gray]*3, axis=-1)
+        frame_rgb = np.stack([frame_gray] * 3, axis=-1)
 
-        # numpy → pygame.Surface
-        # surfarray.make_surface は (W,H,3) 形式を期待するので転置
-        surface = surfarray.make_surface(frame_rgb.swapaxes(0, 1))
+        # numpy → PIL.Image
+        img = Image.fromarray(frame_rgb, mode="RGB")
 
-        # そのまま表示（論理 960x540 を 2x2 → 1920x1080 に拡大）
-        scaled = pygame.transform.scale(surface, (PHYSICAL_WIDTH, PHYSICAL_HEIGHT))
-        screen.blit(scaled, (0, 0))
-        pygame.display.flip()
+        # 物理解像度 (1920x1080) に 2x2 拡大
+        img = img.resize((PHYSICAL_WIDTH, PHYSICAL_HEIGHT), resample=Image.NEAREST)
 
-        clock.tick(fps)
+        # さらに実際のスクリーン解像度にフィットさせたい場合はここでリサイズ（任意）
+        if self.screen_w != PHYSICAL_WIDTH or self.screen_h != PHYSICAL_HEIGHT:
+            img = img.resize((self.screen_w, self.screen_h), resample=Image.NEAREST)
 
-    pygame.time.wait(300)
-    pygame.quit()
+        self.photo = ImageTk.PhotoImage(img)
+        self.label.configure(image=self.photo)
+
+        self.current_frame += 1
+        # 次フレーム
+        self.root.after(self.interval_ms, self.show_next_frame)
+
+    def run(self):
+        self.root.mainloop()
 
 
 # ============================================================
@@ -312,7 +287,7 @@ def playback(ciphertext: bytes, fps: int):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fullscreen encoder (960x540 logical, 2x2 blocks, 16-level grayscale, REPETITIONS=2, numpy-optimized)."
+        description="Fullscreen encoder (Tkinter, 960x540 logical, 2x2 blocks, 16-level grayscale, REPETITIONS=2, numpy-optimized)."
     )
     parser.add_argument("-i", "--input", required=True, help="Input file path")
     parser.add_argument("-p", "--password", help="Password (if omitted, prompt securely)")
@@ -333,7 +308,8 @@ def main():
     ciphertext = encrypt_plaintext(plaintext, password)
     print(f"    Ciphertext size: {len(ciphertext)} bytes")
 
-    playback(ciphertext, args.fps)
+    app = EncoderApp(ciphertext, args.fps)
+    app.run()
     print("[+] Playback finished. Exiting.")
 
 
