@@ -255,7 +255,21 @@ def playback(ciphertext: bytes, fps: int):
     pygame.display.set_caption("Encrypted Visual Stream (960x540 logical, 2x2 blocks, REP=2)")
     pygame.mouse.set_visible(False)
 
-    make_window_topmost()
+    try:
+        hwnd = pygame.display.get_wm_info().get("window")
+        if hwnd:
+            user32 = ctypes.windll.user32
+            HWND_TOPMOST = -1
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            user32.SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE,
+            )
+    except Exception as e:
+        print("[!] TOPMOST failed:", e)
 
     clock = pygame.time.Clock()
 
