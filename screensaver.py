@@ -11,18 +11,19 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from PIL import Image
 
-# 論理解像度（4x4 ブロック単位）
+# 論理解像度（エンコード単位）
 LOGICAL_WIDTH = 480
 LOGICAL_HEIGHT = 270
-BLOCK_SIZE = 4  # 4x4 物理ピクセル = 1 論理ピクセル
 
-# 物理解像度（フルスクリーン）
+# 各論理ピクセルは 4x4 のブロックとして表示する想定
+BLOCK_SIZE = 4  # 拡大倍率
+
+# 物理解像度（ウィンドウ/フルスクリーン）
 PHYSICAL_WIDTH = LOGICAL_WIDTH * BLOCK_SIZE   # 1920
 PHYSICAL_HEIGHT = LOGICAL_HEIGHT * BLOCK_SIZE  # 1080
 
-# 四隅の予約論理ピクセル（4x4 ブロック単位で白固定）
+# 四隅の予約論理ピクセル（位置合わせマーカー用、常に白）
 CORNER_LOGICAL_COORDS = [
     (0, 0),
     (LOGICAL_WIDTH - 1, 0),
@@ -33,10 +34,11 @@ CORNER_LOGICAL_COORDS = [
 # 16色 → 4bit nibble
 NIBBLES_PER_BYTE = 2  # hi, lo
 REPETITIONS = 3       # 各 nibble を3回繰り返す
-LOGICAL_PIXELS_PER_BYTE = NIBBLES_PER_BYTE * REPETITIONS  # 6
+LOGICAL_PIXELS_PER_BYTE = NIBBLES_PER_BYTE * REPETITIONS  # 6 論理ピクセルで1バイト
 
+# 1 フレームに使えるデータ用論理ピクセル数
 DATA_PIXELS_PER_FRAME = LOGICAL_WIDTH * LOGICAL_HEIGHT - len(CORNER_LOGICAL_COORDS)
-BYTES_PER_FRAME = DATA_PIXELS_PER_FRAME // LOGICAL_PIXELS_PER_BYTE  # 1フレームで運べるバイト数
+BYTES_PER_FRAME = DATA_PIXELS_PER_FRAME // LOGICAL_PIXELS_PER_BYTE
 
 PBKDF2_SALT = b"FV-ENC-1"
 PBKDF2_ITERATIONS = 200_000
@@ -44,7 +46,7 @@ PBKDF2_OUTPUT_LEN = 48  # 32 bytes key + 16 bytes IV
 
 
 def derive_key_iv(password: str) -> Tuple[bytes, bytes]:
-    """Derive AES-256 key and IV from password using PBKDF2-HMAC-SHA256."""
+    """パスワードから AES-256 キーと IV を導出する。"""
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=PBKDF2_OUTPUT_LEN,
@@ -59,7 +61,7 @@ def derive_key_iv(password: str) -> Tuple[bytes, bytes]:
 
 
 def build_inner_header(file_path: Path, file_bytes: bytes) -> bytes:
-    """Build 256-byte inner header with metadata."""
+    """256 バイトの内側ヘッダを構築する。"""
     header = bytearray(256)
     # Magic "FVD1"
     header[0:4] = b"FVD1"
@@ -68,7 +70,7 @@ def build_inner_header(file_path: Path, file_bytes: bytes) -> bytes:
     # File size (uint64 BE)
     file_size = len(file_bytes)
     header[8:16] = file_size.to_bytes(8, "big")
-    # SHA-256 hash of file
+    # SHA-256 hash
     sha = hashlib.sha256(file_bytes).digest()
     header[16:48] = sha
 
@@ -76,48 +78,27 @@ def build_inner_header(file_path: Path, file_bytes: bytes) -> bytes:
     name = file_path.name.encode("utf-8")
     if len(name) > 200:
         name = name[:200]
-    header[48] = len(name)  # name_len (uint8)
+    header[48] = len(name)  # name_len
     header[49:49+len(name)] = name
-    # remaining bytes are already zero
+    # 残りは 0 埋めのまま
     return bytes(header)
 
 
 def build_plaintext_block(file_path: Path) -> bytes:
-    """Construct plaintext_block = [header][file_bytes]."""
+    """平文ブロック = [内側ヘッダ][元ファイル] を構築する。"""
     data = file_path.read_bytes()
     header = build_inner_header(file_path, data)
     plaintext = header + data
-    # nibble 方式なので 3 の倍数パディングは不要
     return plaintext
 
 
 def encrypt_plaintext(plaintext: bytes, password: str) -> bytes:
-    """Encrypt plaintext with AES-256-CTR using key/iv derived from password."""
+    """AES-256-CTR で平文ブロックを暗号化し ciphertext を返す。"""
     key, iv = derive_key_iv(password)
     cipher = Cipher(algorithms.AES(key), modes.CTR(iv), backend=default_backend())
     encryptor = cipher.encryptor()
     ciphertext = encryptor.update(plaintext) + encryptor.finalize()
     return ciphertext
-
-
-def logical_to_physical_block(x_log: int, y_log: int) -> Tuple[int, int]:
-    """Convert logical pixel coordinates to top-left physical pixel coordinates."""
-    x_phys = x_log * BLOCK_SIZE
-    y_phys = y_log * BLOCK_SIZE
-    return x_phys, y_phys
-
-
-def fill_block_pil(image: Image.Image, x_log: int, y_log: int, gray: int) -> None:
-    """Fill a 4x4 block corresponding to a logical pixel with given grayscale value."""
-    x0, y0 = logical_to_physical_block(x_log, y_log)
-    color = (gray, gray, gray)
-    for dy in range(BLOCK_SIZE):
-        for dx in range(BLOCK_SIZE):
-            image.putpixel((x0 + dx, y0 + dy), color)
-
-
-def is_corner_logical(x_log: int, y_log: int) -> bool:
-    return (x_log, y_log) in CORNER_LOGICAL_COORDS
 
 
 def nibble_to_gray(nibble: int) -> int:
@@ -164,31 +145,38 @@ class NibbleGenerator:
             return 0
 
 
-def generate_frame_image(ciphertext: bytes, frame_index: int, nib_gen: NibbleGenerator) -> Image.Image:
+def generate_logical_frame_surface(ciphertext: bytes,
+                                   nib_gen: NibbleGenerator) -> pygame.Surface:
     """
-    1フレーム分の PIL.Image を生成する。
-    nib_gen の状態は呼び出し側で持続させる。
+    1フレーム分の「論理解像度」Surface (480x270) を生成する。
+    ここで 4bit nibble → 16段階グレースケールに変換し、
+    四隅以外の論理ピクセルを塗る。
     """
-    img = Image.new("RGB", (PHYSICAL_WIDTH, PHYSICAL_HEIGHT), (0, 0, 0))
+    surface = pygame.Surface((LOGICAL_WIDTH, LOGICAL_HEIGHT))
+    surface.lock()
 
-    for y_log in range(LOGICAL_HEIGHT):
-        for x_log in range(LOGICAL_WIDTH):
-            if is_corner_logical(x_log, y_log):
+    for y in range(LOGICAL_HEIGHT):
+        for x in range(LOGICAL_WIDTH):
+            if (x, y) in CORNER_LOGICAL_COORDS:
+                # corner は後でまとめて白にするので一旦スキップしてもよいが、
+                # ここで直接白を書いてもよい
                 continue
-            nibble = nib_gen.next_nibble()
-            gray = nibble_to_gray(nibble)
-            fill_block_pil(img, x_log, y_log, gray)
+            nib = nib_gen.next_nibble()
+            gray = nibble_to_gray(nib)
+            surface.set_at((x, y), (gray, gray, gray))
 
-    # 四隅は白ブロックにする（位置合わせマーカー）
+    # 四隅を白で上書き（位置合わせマーカー）
     for (cx, cy) in CORNER_LOGICAL_COORDS:
-        fill_block_pil(img, cx, cy, 255)
+        surface.set_at((cx, cy), (255, 255, 255))
 
-    return img
+    surface.unlock()
+    return surface
 
 
 def run_fullscreen_playback(ciphertext: bytes, fps: int) -> None:
     """
-    ciphertext をフレーム列にマッピングし、フルスクリーンで順次表示して終了する。
+    ciphertext をフレーム列にマッピングし、
+    フルスクリーンで順次表示して終了する。
     """
     if BYTES_PER_FRAME <= 0:
         raise ValueError("BYTES_PER_FRAME must be positive")
@@ -200,54 +188,62 @@ def run_fullscreen_playback(ciphertext: bytes, fps: int) -> None:
 
     # pygame 初期化
     pygame.init()
-    # フルスクリーン 1920x1080 前提
-    screen = pygame.display.set_mode((PHYSICAL_WIDTH, PHYSICAL_HEIGHT), pygame.FULLSCREEN)
+    # フルスクリーン & ダブルバッファ
+    screen = pygame.display.set_mode(
+        (PHYSICAL_WIDTH, PHYSICAL_HEIGHT),
+        pygame.FULLSCREEN | pygame.DOUBLEBUF
+    )
     pygame.display.set_caption("Encrypted Stream Encoder")
-    clock = pygame.time.Clock()
+    pygame.mouse.set_visible(False)  # マウスカーソル非表示
 
+    clock = pygame.time.Clock()
     nib_gen = NibbleGenerator(ciphertext, REPETITIONS)
 
     running = True
     for frame_index in range(frame_count):
+        # イベント処理（ESC で中断可能）
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
-                # ESC で強制終了
                 if event.key == pygame.K_ESCAPE:
                     running = False
 
         if not running:
             break
 
-        # 1フレーム分の画像を生成（PIL）
-        img = generate_frame_image(ciphertext, frame_index, nib_gen)
-
-        # PIL → pygame Surface 変換
-        mode = img.mode
-        size = img.size
-        data = img.tobytes()
-        surface = pygame.image.frombuffer(data, size, mode)
+        # 1フレーム分の論理 Surface を生成
+        logical_surf = generate_logical_frame_surface(ciphertext, nib_gen)
+        # 物理解像度に拡大（最近傍補間）
+        scaled_surf = pygame.transform.scale(
+            logical_surf, (PHYSICAL_WIDTH, PHYSICAL_HEIGHT)
+        )
 
         # 描画
-        screen.blit(surface, (0, 0))
+        screen.blit(scaled_surf, (0, 0))
         pygame.display.flip()
 
         # fps 制御
         clock.tick(fps)
 
-    # 最後に少し待つ（お好みで短くしても良い）
-    pygame.time.wait(500)
+    # 少し待ってから終了
+    pygame.time.wait(300)
     pygame.quit()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Encode a file into an encrypted fullscreen visual stream (1920x1080, 4x4 blocks, 16-level grayscale, repeated nibbles)."
+        description=(
+            "Encode a file into an encrypted fullscreen visual stream "
+            "(1920x1080, 4x4 blocks, 16-level grayscale, repeated nibbles)."
+        )
     )
     parser.add_argument("-i", "--input", required=True, help="Input file path")
     parser.add_argument("-p", "--password", help="Password (if omitted, prompt securely)")
-    parser.add_argument("--fps", type=int, default=10, help="Frames per second (default: 10)")
+    parser.add_argument(
+        "--fps", type=int, default=10,
+        help="Frames per second for playback (default: 10)"
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
