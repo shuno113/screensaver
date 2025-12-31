@@ -14,16 +14,16 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from PIL import Image
 
-# 論理解像度（4x4 ブロック単位）
-LOGICAL_WIDTH = 480
-LOGICAL_HEIGHT = 270
-BLOCK_SIZE = 4  # 4x4 物理ピクセル = 1 論理ピクセル
+# 論理解像度（2x2 ブロック単位）
+LOGICAL_WIDTH = 960
+LOGICAL_HEIGHT = 540
+BLOCK_SIZE = 2  # 2x2 物理ピクセル = 1 論理ピクセル
 
 # 物理解像度（動画の実サイズ）
 PHYSICAL_WIDTH = LOGICAL_WIDTH * BLOCK_SIZE   # 1920
 PHYSICAL_HEIGHT = LOGICAL_HEIGHT * BLOCK_SIZE  # 1080
 
-# 四隅の予約論理ピクセル（4x4 ブロック単位で白固定）
+# 四隅の予約論理ピクセル（2x2 ブロック単位で白固定）
 CORNER_LOGICAL_COORDS = [
     (0, 0),
     (LOGICAL_WIDTH - 1, 0),
@@ -33,8 +33,8 @@ CORNER_LOGICAL_COORDS = [
 
 # 16色 → 4bit nibble
 NIBBLES_PER_BYTE = 2  # hi, lo
-REPETITIONS = 3       # 各 nibble を3回繰り返す
-LOGICAL_PIXELS_PER_BYTE = NIBBLES_PER_BYTE * REPETITIONS  # 6
+REPETITIONS = 2       # 各 nibble を2回繰り返す
+LOGICAL_PIXELS_PER_BYTE = NIBBLES_PER_BYTE * REPETITIONS  # 4
 
 DATA_PIXELS_PER_FRAME = LOGICAL_WIDTH * LOGICAL_HEIGHT - len(CORNER_LOGICAL_COORDS)
 BYTES_PER_FRAME = DATA_PIXELS_PER_FRAME // LOGICAL_PIXELS_PER_BYTE  # 1フレームで運べるバイト数
