@@ -10,7 +10,7 @@
 *   **Image Processing**: `Pillow` (PIL), `numpy`。
 *   **Video Processing**: `ffmpeg` (コマンドラインツール) を `subprocess` 経由で呼び出し。
 
-### 1.2. `screensaver/screensaver.py` (Encoder / Player)
+### 1.2. `screensaver.py` (Encoder / Player)
 *   **概要**: 暗号化データをリアルタイムで画面に描画する。
 *   **GUI**: `tkinter` を使用してフルスクリーンウィンドウを作成。
 *   **描画ループ**: `numpy` でフレームデータを生成し、`PIL.Image` -> `ImageTk.PhotoImage` を経由して `tk.Label` に設定。
