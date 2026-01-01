@@ -5,108 +5,25 @@ import hashlib
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Tuple, List
+from typing import List
 
 import numpy as np
 from PIL import Image
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-from config import (
+from lib.config import (
     LOGICAL_WIDTH,
     LOGICAL_HEIGHT,
-    BLOCK_SIZE,
     CORNER_LOGICAL_COORDS,
-    NIBBLES_PER_BYTE,
     REPETITIONS,
-    PBKDF2_SALT,
-    PBKDF2_ITERATIONS,
-    PBKDF2_OUTPUT_LEN,
     CORNER_WHITE_THRESHOLD,
 )
+from lib.crypto import decrypt_ciphertext
+from lib.header import parse_inner_header, write_unique_file
+from lib.nibble import gray_to_nibble
+from lib.frame import precompute_data_indices
 
 # nibble（4bit）による 16 色表現
 GROUP_SIZE = 2 * REPETITIONS  # 4 nibbles / byte
-
-
-# ============================================================
-#  暗号復号関連
-# ============================================================
-
-def derive_key_iv(password: str) -> Tuple[bytes, bytes]:
-    """パスワードから AES-256 キーと IV を導出する。"""
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=PBKDF2_OUTPUT_LEN,
-        salt=PBKDF2_SALT,
-        iterations=PBKDF2_ITERATIONS,
-        backend=default_backend(),
-    )
-    derived = kdf.derive(password.encode("utf-8"))
-    key = derived[:32]
-    iv = derived[32:]
-    return key, iv
-
-
-def decrypt_ciphertext(ciphertext: bytes, password: str) -> bytes:
-    """AES-256-CTR で暗号文を復号して平文ブロックを得る。"""
-    key, iv = derive_key_iv(password)
-    cipher = Cipher(algorithms.AES(key), modes.CTR(iv), backend=default_backend())
-    decryptor = cipher.decryptor()
-    plaintext = decryptor.update(ciphertext) + decryptor.finalize()
-    return plaintext
-
-
-# ============================================================
-#  ヘッダ解析
-# ============================================================
-
-def parse_inner_header(header: bytes) -> Tuple[int, bytes, str]:
-    """
-    256 バイトの内側ヘッダを解析し、
-    (file_size, file_hash, filename) を返す。
-    """
-    if len(header) != 256:
-        raise ValueError("Inner header must be exactly 256 bytes")
-
-    magic = header[0:4]
-    if magic != b"FVD1":
-        raise ValueError(f"Invalid magic: {magic!r}, expected b'FVD1'")
-
-    header_size = int.from_bytes(header[4:8], "big")
-    if header_size != 256:
-        raise ValueError(f"Invalid header size: {header_size}, expected 256")
-
-    file_size = int.from_bytes(header[8:16], "big")
-    file_hash = header[16:48]
-
-    name_len = header[48]
-    if name_len > 200:
-        raise ValueError(f"Invalid name_len: {name_len}, must be <= 200")
-    name_bytes = header[49:49 + name_len]
-    filename = name_bytes.decode("utf-8", errors="replace")
-
-    return file_size, file_hash, filename
-
-
-def write_unique_file(base_dir: Path, filename: str, data: bytes) -> Path:
-    """既存ファイルがある場合は (1), (2) ... を付けて保存する。"""
-    target = base_dir / filename
-    if not target.exists():
-        target.write_bytes(data)
-        return target
-
-    stem = Path(filename).stem
-    suffix = Path(filename).suffix
-    counter = 1
-    while True:
-        candidate = base_dir / f"{stem} ({counter}){suffix}"
-        if not candidate.exists():
-            candidate.write_bytes(data)
-            return candidate
-        counter += 1
 
 
 # ============================================================
@@ -139,42 +56,8 @@ def run_ffmpeg_extract_frames(video_path: Path, tmpdir: Path) -> List[Path]:
 
 
 # ============================================================
-#  nibble / グレースケール変換
+#  フレーム処理
 # ============================================================
-
-def gray_to_nibble(gray: np.ndarray) -> np.ndarray:
-    """
-    0..255 のグレースケール配列を 0..15 の nibble 配列に変換する。
-    nibble = round(gray * 15 / 255)
-    """
-    gray_f = gray.astype(np.float32)
-    level = np.round(gray_f * (15.0 / 255.0)).astype(np.int16)
-    level = np.clip(level, 0, 15)
-    return level.astype(np.uint8)
-
-
-def precompute_data_indices() -> Tuple[np.ndarray, np.ndarray]:
-    """
-    全論理ピクセルのフラットインデックスを作り、
-    四隅を除いた「データ格納用インデックス」と、
-    四隅のインデックスを返す。
-    """
-    h, w = LOGICAL_HEIGHT, LOGICAL_WIDTH
-    total = h * w
-    all_indices = np.arange(total, dtype=np.int32)
-
-    corner_indices = []
-    for (cx, cy) in CORNER_LOGICAL_COORDS:
-        idx = cy * LOGICAL_WIDTH + cx
-        corner_indices.append(idx)
-    corner_indices = np.array(corner_indices, dtype=np.int32)
-
-    mask = np.ones(total, dtype=bool)
-    mask[corner_indices] = False
-    data_indices = all_indices[mask]
-
-    return data_indices, corner_indices
-
 
 def verify_corners(frame_gray: np.ndarray) -> None:
     """
@@ -203,8 +86,7 @@ def extract_nibbles_from_frames(frame_files: List[Path]) -> np.ndarray:
     for frame_path in frame_files:
         img = Image.open(frame_path).convert("RGB")
 
-        # 論理解像度にリサイズ（エンコード側は 960x540→2x2拡大しているので、
-        # キャプチャ動画からはこれを逆にたたむイメージ）
+        # 論理解像度にリサイズ
         img = img.resize((LOGICAL_WIDTH, LOGICAL_HEIGHT), resample=Image.NEAREST)
 
         arr = np.array(img, dtype=np.uint8)  # (H, W, 3)

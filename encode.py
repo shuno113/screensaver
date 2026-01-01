@@ -1,93 +1,27 @@
 #!/usr/bin/env python3
 import argparse
 import getpass
-import hashlib
 import math
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Tuple
 
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from PIL import Image
 
-from config import (
+from lib.config import (
     LOGICAL_WIDTH,
     LOGICAL_HEIGHT,
     BLOCK_SIZE,
     PHYSICAL_WIDTH,
     PHYSICAL_HEIGHT,
     CORNER_LOGICAL_COORDS,
-    NIBBLES_PER_BYTE,
     REPETITIONS,
-    LOGICAL_PIXELS_PER_BYTE,
-    DATA_PIXELS_PER_FRAME,
     BYTES_PER_FRAME,
-    PBKDF2_SALT,
-    PBKDF2_ITERATIONS,
-    PBKDF2_OUTPUT_LEN,
 )
-
-
-def derive_key_iv(password: str) -> Tuple[bytes, bytes]:
-    """Derive AES-256 key and IV from password using PBKDF2-HMAC-SHA256."""
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=PBKDF2_OUTPUT_LEN,
-        salt=PBKDF2_SALT,
-        iterations=PBKDF2_ITERATIONS,
-        backend=default_backend(),
-    )
-    derived = kdf.derive(password.encode("utf-8"))
-    key = derived[:32]
-    iv = derived[32:]
-    return key, iv
-
-
-def build_inner_header(file_path: Path, file_bytes: bytes) -> bytes:
-    """Build 256-byte inner header with metadata."""
-    header = bytearray(256)
-    # Magic "FVD1"
-    header[0:4] = b"FVD1"
-    # Header size = 256 (uint32 BE)
-    header[4:8] = (256).to_bytes(4, "big")
-    # File size (uint64 BE)
-    file_size = len(file_bytes)
-    header[8:16] = file_size.to_bytes(8, "big")
-    # SHA-256 hash of file
-    sha = hashlib.sha256(file_bytes).digest()
-    header[16:48] = sha
-
-    # File name (no directory)
-    name = file_path.name.encode("utf-8")
-    if len(name) > 200:
-        name = name[:200]
-    header[48] = len(name)  # name_len (uint8)
-    header[49:49+len(name)] = name
-    # remaining bytes are already zero
-    return bytes(header)
-
-
-def build_plaintext_block(file_path: Path) -> bytes:
-    """Construct plaintext_block = [header][file_bytes][optional padding]."""
-    data = file_path.read_bytes()
-    header = build_inner_header(file_path, data)
-    plaintext = header + data
-    # 以前は 3 の倍数にしていたが、新方式では必須ではない。
-    # 必要なら少しだけゼロパディングしても良いし、無しでも良い。
-    return plaintext
-
-
-def encrypt_plaintext(plaintext: bytes, password: str) -> bytes:
-    """Encrypt plaintext with AES-256-CTR using key/iv derived from password."""
-    key, iv = derive_key_iv(password)
-    cipher = Cipher(algorithms.AES(key), modes.CTR(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    ciphertext = encryptor.update(plaintext) + encryptor.finalize()
-    return ciphertext
+from lib.crypto import encrypt_plaintext
+from lib.header import build_plaintext_block
+from lib.nibble import nibble_to_gray
 
 
 def logical_to_physical_block(x_log: int, y_log: int) -> Tuple[int, int]:
@@ -98,7 +32,7 @@ def logical_to_physical_block(x_log: int, y_log: int) -> Tuple[int, int]:
 
 
 def fill_block(image: Image.Image, x_log: int, y_log: int, gray: int) -> None:
-    """Fill a 4x4 block corresponding to a logical pixel with given grayscale value."""
+    """Fill a 2x2 block corresponding to a logical pixel with given grayscale value."""
     x0, y0 = logical_to_physical_block(x_log, y_log)
     color = (gray, gray, gray)
     for dy in range(BLOCK_SIZE):
@@ -108,15 +42,6 @@ def fill_block(image: Image.Image, x_log: int, y_log: int, gray: int) -> None:
 
 def is_corner_logical(x_log: int, y_log: int) -> bool:
     return (x_log, y_log) in CORNER_LOGICAL_COORDS
-
-
-def nibble_to_gray(nibble: int) -> int:
-    """
-    0..15 の nibble を 0..255 のグレースケールにマップする。
-    16段階の等間隔レベル。
-    """
-    nibble = max(0, min(15, nibble))
-    return round(nibble * 255 / 15)
 
 
 class NibbleGenerator:
@@ -195,7 +120,7 @@ def run_ffmpeg(tmp_dir: Path, output_path: Path, fps: int) -> None:
         "-i", str(tmp_dir / "frame_%06d.png"),
         "-c:v", "libx264",
         "-preset", "slow",
-        "-crf", "5",        # ここはロスレスではないが、16色+繰り返しである程度耐性を持たせる前提
+        "-crf", "5",
         "-pix_fmt", "yuv444p",
         str(output_path),
     ]
@@ -210,7 +135,7 @@ def run_ffmpeg(tmp_dir: Path, output_path: Path, fps: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Encode a file into an encrypted H.264 video (1920x1080, 4x4 blocks, 16-level grayscale, repeated nibbles)."
+        description="Encode a file into an encrypted H.264 video (1920x1080, 2x2 blocks, 16-level grayscale, repeated nibbles)."
     )
     parser.add_argument("-i", "--input", required=True, help="Input file path")
     parser.add_argument("-o", "--output", required=True, help="Output MP4 file path")
