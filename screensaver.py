@@ -15,41 +15,22 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# ============================================================
-#  基本設定
-# ============================================================
-
-# 論理解像度（データ格納用グリッド）
-LOGICAL_WIDTH = 960
-LOGICAL_HEIGHT = 540
-
-# 各論理ピクセルを 2x2 のブロックとして表示 → 物理解像度 1920x1080
-BLOCK_SIZE = 2
-PHYSICAL_WIDTH = LOGICAL_WIDTH * BLOCK_SIZE    # 1920
-PHYSICAL_HEIGHT = LOGICAL_HEIGHT * BLOCK_SIZE  # 1080
-
-# 四隅マーカー（論理座標）
-CORNER_LOGICAL_COORDS = [
-    (0, 0),
-    (LOGICAL_WIDTH - 1, 0),
-    (0, LOGICAL_HEIGHT - 1),
-    (LOGICAL_WIDTH - 1, LOGICAL_HEIGHT - 1),
-]
-
-# 16色 → 4bit nibble
-NIBBLES_PER_BYTE = 2  # hi, lo
-REPETITIONS = 2       # ★ nibble を2回ずつ繰り返す（高速化のため冗長度を減らした）
-LOGICAL_PIXELS_PER_BYTE = NIBBLES_PER_BYTE * REPETITIONS  # 4 論理ピクセルで1バイト
-
-# 1 フレームに使えるデータ用論理ピクセル数
-TOTAL_LOGICAL_PIXELS = LOGICAL_WIDTH * LOGICAL_HEIGHT
-DATA_PIXELS_PER_FRAME = TOTAL_LOGICAL_PIXELS - len(CORNER_LOGICAL_COORDS)
-BYTES_PER_FRAME = DATA_PIXELS_PER_FRAME // LOGICAL_PIXELS_PER_BYTE
-
-# AES / PBKDF2
-PBKDF2_SALT = b"FV-ENC-1"
-PBKDF2_ITERATIONS = 200_000
-PBKDF2_OUTPUT_LEN = 48  # 32 bytes key, 16 bytes IV
+from config import (
+    LOGICAL_WIDTH,
+    LOGICAL_HEIGHT,
+    BLOCK_SIZE,
+    PHYSICAL_WIDTH,
+    PHYSICAL_HEIGHT,
+    CORNER_LOGICAL_COORDS,
+    NIBBLES_PER_BYTE,
+    REPETITIONS,
+    LOGICAL_PIXELS_PER_BYTE,
+    DATA_PIXELS_PER_FRAME,
+    BYTES_PER_FRAME,
+    PBKDF2_SALT,
+    PBKDF2_ITERATIONS,
+    PBKDF2_OUTPUT_LEN,
+)
 
 
 # ============================================================

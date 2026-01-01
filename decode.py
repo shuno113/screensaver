@@ -14,37 +14,21 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# ============================================================
-#  エンコード側と合わせたプロトコル定数
-# ============================================================
-
-# 論理解像度（エンコード側と同じ）
-LOGICAL_WIDTH = 960
-LOGICAL_HEIGHT = 540
-
-# 各論理ピクセルを 2x2 のブロックとして表示している（キャプチャ動画は 1920x1080 前提）
-BLOCK_SIZE = 2  # デコードでは resize で 960x540 に落とすので直接は使わないが定義だけ合わせる
-
-# 四隅マーカー（論理座標）
-CORNER_LOGICAL_COORDS = [
-    (0, 0),
-    (LOGICAL_WIDTH - 1, 0),
-    (0, LOGICAL_HEIGHT - 1),
-    (LOGICAL_WIDTH - 1, LOGICAL_HEIGHT - 1),
-]
+from config import (
+    LOGICAL_WIDTH,
+    LOGICAL_HEIGHT,
+    BLOCK_SIZE,
+    CORNER_LOGICAL_COORDS,
+    NIBBLES_PER_BYTE,
+    REPETITIONS,
+    PBKDF2_SALT,
+    PBKDF2_ITERATIONS,
+    PBKDF2_OUTPUT_LEN,
+    CORNER_WHITE_THRESHOLD,
+)
 
 # nibble（4bit）による 16 色表現
-NIBBLES_PER_BYTE = 2       # hi, lo
-REPETITIONS = 2            # ★ エンコード側と同じく hi×2, lo×2
 GROUP_SIZE = 2 * REPETITIONS  # 4 nibbles / byte
-
-# AES / PBKDF2
-PBKDF2_SALT = b"FV-ENC-1"
-PBKDF2_ITERATIONS = 200_000
-PBKDF2_OUTPUT_LEN = 48  # 32 bytes key, 16 bytes IV
-
-# コーナーマーカー（白）のしきい値
-CORNER_WHITE_THRESHOLD = 128
 
 
 # ============================================================
