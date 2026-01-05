@@ -11,7 +11,6 @@ Transporter - Visual Data Transfer System
     python transporter.py play -i file.txt
 """
 import argparse
-import getpass
 import hashlib
 import math
 import subprocess
@@ -22,10 +21,6 @@ from typing import Tuple, List, TYPE_CHECKING
 
 import numpy as np
 from PIL import Image
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 if TYPE_CHECKING:
     import tkinter as tk
@@ -57,45 +52,8 @@ LOGICAL_PIXELS_PER_BYTE: int = NIBBLES_PER_BYTE * REPETITIONS
 DATA_PIXELS_PER_FRAME: int = LOGICAL_WIDTH * LOGICAL_HEIGHT - len(CORNER_LOGICAL_COORDS)
 BYTES_PER_FRAME: int = DATA_PIXELS_PER_FRAME // LOGICAL_PIXELS_PER_BYTE
 
-PBKDF2_SALT: bytes = b"FV-ENC-1"
-PBKDF2_ITERATIONS: int = 200_000
-PBKDF2_OUTPUT_LEN: int = 48
-
 CORNER_WHITE_THRESHOLD: int = 128
 GROUP_SIZE: int = 2 * REPETITIONS
-
-
-# ============================================================
-#  暗号処理
-# ============================================================
-
-def derive_key_iv(password: str) -> Tuple[bytes, bytes]:
-    """パスワードから AES-256 キーと IV を導出する。"""
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=PBKDF2_OUTPUT_LEN,
-        salt=PBKDF2_SALT,
-        iterations=PBKDF2_ITERATIONS,
-        backend=default_backend(),
-    )
-    derived = kdf.derive(password.encode("utf-8"))
-    return derived[:32], derived[32:]
-
-
-def encrypt_plaintext(plaintext: bytes, password: str) -> bytes:
-    """AES-256-CTR で平文ブロックを暗号化。"""
-    key, iv = derive_key_iv(password)
-    cipher = Cipher(algorithms.AES(key), modes.CTR(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
-    return encryptor.update(plaintext) + encryptor.finalize()
-
-
-def decrypt_ciphertext(ciphertext: bytes, password: str) -> bytes:
-    """AES-256-CTR で暗号文を復号。"""
-    key, iv = derive_key_iv(password)
-    cipher = Cipher(algorithms.AES(key), modes.CTR(iv), backend=default_backend())
-    decryptor = cipher.decryptor()
-    return decryptor.update(ciphertext) + decryptor.finalize()
 
 
 # ============================================================
@@ -298,7 +256,7 @@ def reconstruct_ciphertext_from_nibbles(nibbles: np.ndarray) -> bytes:
     return bytes(((hi << 4) | lo).astype(np.uint8))
 
 
-def decode_video_to_file(video_path: Path, password: str, output_dir: Path) -> Path:
+def decode_video_to_file(video_path: Path, output_dir: Path) -> Path:
     """動画をデコードしてファイルを復元する。"""
     with tempfile.TemporaryDirectory() as tmpdir_str:
         tmpdir = Path(tmpdir_str)
@@ -309,18 +267,16 @@ def decode_video_to_file(video_path: Path, password: str, output_dir: Path) -> P
         nibbles = extract_nibbles_from_frames(frame_files)
         print(f"    Total nibbles: {nibbles.size}")
 
-    print("[+] Reconstructing ciphertext ...")
-    ciphertext = reconstruct_ciphertext_from_nibbles(nibbles)
-    print(f"    Ciphertext size: {len(ciphertext)} bytes")
+    print("[+] Reconstructing data ...")
+    data = reconstruct_ciphertext_from_nibbles(nibbles)
+    print(f"    Data size: {len(data)} bytes")
 
-    print("[+] Decrypting ...")
-    plaintext = decrypt_ciphertext(ciphertext, password)
-    if len(plaintext) < 256:
-        raise ValueError("Plaintext too short")
+    if len(data) < 256:
+        raise ValueError("Data too short")
 
-    file_size, file_hash, filename = parse_inner_header(plaintext[:256])
+    file_size, file_hash, filename = parse_inner_header(data[:256])
     print(f"[+] Header: filename={filename!r}, size={file_size}")
-    file_data = plaintext[256:256 + file_size]
+    file_data = data[256:256 + file_size]
 
     if hashlib.sha256(file_data).digest() != file_hash:
         raise ValueError("SHA-256 hash mismatch")
@@ -402,19 +358,15 @@ def cmd_encode(args):
     input_path = Path(args.input)
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
-    password = args.password or getpass.getpass("Password: ")
 
-    print(f"[+] Building plaintext from {input_path} ...")
-    plaintext = build_plaintext_block(input_path)
-    print(f"    Size: {len(plaintext)} bytes")
-
-    print("[+] Encrypting ...")
-    ciphertext = encrypt_plaintext(plaintext, password)
+    print(f"[+] Building data from {input_path} ...")
+    data = build_plaintext_block(input_path)
+    print(f"    Size: {len(data)} bytes")
 
     with tempfile.TemporaryDirectory() as tmpdir_str:
         tmpdir = Path(tmpdir_str)
         print("[+] Generating frames ...")
-        frame_count = generate_frames(ciphertext, tmpdir, args.fps)
+        frame_count = generate_frames(data, tmpdir, args.fps)
         print(f"    Generated {frame_count} frames")
         print("[+] Creating video ...")
         run_ffmpeg_encode(tmpdir, Path(args.output), args.fps)
@@ -429,8 +381,7 @@ def cmd_decode(args):
         raise FileNotFoundError(f"Video not found: {video_path}")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    password = args.password or getpass.getpass("Password: ")
-    decode_video_to_file(video_path, password, output_dir)
+    decode_video_to_file(video_path, output_dir)
 
 
 def cmd_play(args):
@@ -438,14 +389,11 @@ def cmd_play(args):
     input_path = Path(args.input)
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
-    password = args.password or getpass.getpass("Password: ")
 
-    print(f"[+] Building plaintext from {input_path} ...")
-    plaintext = build_plaintext_block(input_path)
-    print("[+] Encrypting ...")
-    ciphertext = encrypt_plaintext(plaintext, password)
+    print(f"[+] Building data from {input_path} ...")
+    data = build_plaintext_block(input_path)
 
-    EncoderApp(ciphertext, args.fps).run()
+    EncoderApp(data, args.fps).run()
     print("[+] Playback finished.")
 
 
@@ -456,30 +404,27 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 例:
-  python transporter.py encode -i secret.txt -o output.mp4 -p password
-  python transporter.py decode -i output.mp4 -d ./recovered -p password
-  python transporter.py play -i secret.txt -p password --fps 15
+  python transporter.py encode -i file.txt -o output.mp4
+  python transporter.py decode -i output.mp4 -d ./recovered
+  python transporter.py play -i file.txt --fps 15
 """
     )
     subparsers = parser.add_subparsers(dest="command", help="コマンド")
 
     # encode
-    p_enc = subparsers.add_parser("encode", help="ファイルを暗号化してMP4動画に変換")
+    p_enc = subparsers.add_parser("encode", help="ファイルをMP4動画に変換")
     p_enc.add_argument("-i", "--input", required=True, help="入力ファイル")
     p_enc.add_argument("-o", "--output", required=True, help="出力MP4ファイル")
-    p_enc.add_argument("-p", "--password", help="パスワード")
     p_enc.add_argument("--fps", type=int, default=10, help="フレームレート")
 
     # decode
     p_dec = subparsers.add_parser("decode", help="MP4動画からファイルを復元")
     p_dec.add_argument("-i", "--input", required=True, help="入力動画ファイル")
     p_dec.add_argument("-d", "--output-dir", default=".", help="出力ディレクトリ")
-    p_dec.add_argument("-p", "--password", help="パスワード")
 
     # play
     p_play = subparsers.add_parser("play", help="フルスクリーン再生")
     p_play.add_argument("-i", "--input", required=True, help="入力ファイル")
-    p_play.add_argument("-p", "--password", help="パスワード")
     p_play.add_argument("--fps", type=int, default=10, help="フレームレート")
 
     args = parser.parse_args()
