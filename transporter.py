@@ -6,9 +6,8 @@ Transporter - Visual Data Transfer System
 エアギャップ環境からのデータ転送を可能にするシステム。
 
 使用方法:
-    python transporter.py encode -i file.txt -o output.mp4
-    python transporter.py decode -i output.mp4 -d ./output
     python transporter.py play -i file.txt
+    python transporter.py decode -i output.mp4 -d ./output
 """
 import argparse
 import hashlib
@@ -155,65 +154,6 @@ def precompute_data_indices() -> Tuple[np.ndarray, np.ndarray]:
     return all_indices[mask], corner_indices
 
 
-# ============================================================
-#  エンコード機能
-# ============================================================
-
-class NibbleGenerator:
-    """ciphertext から nibble を順番に生成する。"""
-    def __init__(self, ciphertext: bytes, repetitions: int):
-        self.ciphertext = ciphertext
-        self.repetitions = repetitions
-        self.byte_index = 0
-        self.phase = 0
-
-    def next_nibble(self) -> int:
-        if self.byte_index < len(self.ciphertext):
-            b = self.ciphertext[self.byte_index]
-            nib = (b >> 4) & 0x0F if self.phase < self.repetitions else b & 0x0F
-            self.phase += 1
-            if self.phase >= 2 * self.repetitions:
-                self.phase = 0
-                self.byte_index += 1
-            return nib
-        return 0
-
-
-def fill_block(image: Image.Image, x_log: int, y_log: int, gray: int) -> None:
-    """論理ピクセルに対応するブロックを塗りつぶす。"""
-    x0, y0 = x_log * BLOCK_SIZE, y_log * BLOCK_SIZE
-    color = (gray, gray, gray)
-    for dy in range(BLOCK_SIZE):
-        for dx in range(BLOCK_SIZE):
-            image.putpixel((x0 + dx, y0 + dy), color)
-
-
-def generate_frames(ciphertext: bytes, tmp_dir: Path, fps: int) -> int:
-    """暗号文からPNGフレームを生成する。"""
-    frame_count = math.ceil(len(ciphertext) / BYTES_PER_FRAME)
-    nib_gen = NibbleGenerator(ciphertext, REPETITIONS)
-
-    for frame_index in range(frame_count):
-        img = Image.new("RGB", (PHYSICAL_WIDTH, PHYSICAL_HEIGHT), (0, 0, 0))
-        for y_log in range(LOGICAL_HEIGHT):
-            for x_log in range(LOGICAL_WIDTH):
-                if (x_log, y_log) in CORNER_LOGICAL_COORDS:
-                    continue
-                fill_block(img, x_log, y_log, nibble_to_gray(nib_gen.next_nibble()))
-        for cx, cy in CORNER_LOGICAL_COORDS:
-            fill_block(img, cx, cy, 255)
-        img.save(tmp_dir / f"frame_{frame_index:06d}.png", format="PNG")
-    return frame_count
-
-
-def run_ffmpeg_encode(tmp_dir: Path, output_path: Path, fps: int) -> None:
-    """ffmpeg でフレームを動画に変換する。"""
-    cmd = ["ffmpeg", "-y", "-framerate", str(fps), "-i", str(tmp_dir / "frame_%06d.png"),
-           "-c:v", "libx264", "-preset", "slow", "-crf", "5", "-pix_fmt", "yuv444p", str(output_path)]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {result.stderr.decode(errors='ignore')}")
-
 
 # ============================================================
 #  デコード機能
@@ -353,26 +293,6 @@ class EncoderApp:
 #  CLI コマンド
 # ============================================================
 
-def cmd_encode(args):
-    """encode コマンド"""
-    input_path = Path(args.input)
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
-
-    print(f"[+] Building data from {input_path} ...")
-    data = build_plaintext_block(input_path)
-    print(f"    Size: {len(data)} bytes")
-
-    with tempfile.TemporaryDirectory() as tmpdir_str:
-        tmpdir = Path(tmpdir_str)
-        print("[+] Generating frames ...")
-        frame_count = generate_frames(data, tmpdir, args.fps)
-        print(f"    Generated {frame_count} frames")
-        print("[+] Creating video ...")
-        run_ffmpeg_encode(tmpdir, Path(args.output), args.fps)
-
-    print(f"[+] Done: {args.output}")
-
 
 def cmd_decode(args):
     """decode コマンド"""
@@ -404,35 +324,28 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 例:
-  python transporter.py encode -i file.txt -o output.mp4
-  python transporter.py decode -i output.mp4 -d ./recovered
   python transporter.py play -i file.txt --fps 15
+  python transporter.py decode -i output.mp4 -d ./recovered
 """
     )
     subparsers = parser.add_subparsers(dest="command", help="コマンド")
-
-    # encode
-    p_enc = subparsers.add_parser("encode", help="ファイルをMP4動画に変換")
-    p_enc.add_argument("-i", "--input", required=True, help="入力ファイル")
-    p_enc.add_argument("-o", "--output", required=True, help="出力MP4ファイル")
-    p_enc.add_argument("--fps", type=int, default=10, help="フレームレート")
-
-    # decode
-    p_dec = subparsers.add_parser("decode", help="MP4動画からファイルを復元")
-    p_dec.add_argument("-i", "--input", required=True, help="入力動画ファイル")
-    p_dec.add_argument("-d", "--output-dir", default=".", help="出力ディレクトリ")
 
     # play
     p_play = subparsers.add_parser("play", help="フルスクリーン再生")
     p_play.add_argument("-i", "--input", required=True, help="入力ファイル")
     p_play.add_argument("--fps", type=int, default=10, help="フレームレート")
 
+    # decode
+    p_dec = subparsers.add_parser("decode", help="MP4動画からファイルを復元")
+    p_dec.add_argument("-i", "--input", required=True, help="入力動画ファイル")
+    p_dec.add_argument("-d", "--output-dir", default=".", help="出力ディレクトリ")
+
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
         sys.exit(1)
 
-    {"encode": cmd_encode, "decode": cmd_decode, "play": cmd_play}[args.command](args)
+    {"decode": cmd_decode, "play": cmd_play}[args.command](args)
 
 
 if __name__ == "__main__":
