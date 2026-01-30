@@ -30,6 +30,12 @@ if TYPE_CHECKING:
 
 class EncoderApp:
     """Tkinter フルスクリーン再生アプリ。"""
+    
+    # キーフレーム色 (RGB)
+    KEY_FRAME_START_COLOR = (0, 255, 0)   # 緑: 開始
+    KEY_FRAME_END_COLOR = (255, 0, 0)     # 赤: 終了
+    KEY_FRAME_DURATION_SEC = 1            # キーフレーム表示時間（秒）
+    
     def __init__(self, ciphertext: bytes, fps: int):
         import tkinter as tk
         from PIL import ImageTk
@@ -42,7 +48,12 @@ class EncoderApp:
         self.data_indices, self.corner_indices = precompute_data_indices()
         self.frame_count = calculate_frame_count(len(ciphertext))
         self.offset = 0
-        self.current_frame = 0
+        self.current_data_frame = 0
+        
+        # キーフレーム用
+        self.key_frame_count = fps * self.KEY_FRAME_DURATION_SEC
+        self.current_key_frame = 0
+        self.phase = "start_key"  # "start_key" -> "data" -> "end_key"
 
         self.root = tk.Tk()
         self.root.attributes("-fullscreen", True)
@@ -53,11 +64,42 @@ class EncoderApp:
         self.label = tk.Label(self.root, bg="black")
         self.label.pack(fill="both", expand=True)
         self.photo = None
-        self.root.after(0, self.show_next_frame)
-
-    def show_next_frame(self):
-        if self.current_frame >= self.frame_count:
+        self.root.after(0, self._show_frame)
+    
+    def _create_solid_image(self, color: tuple) -> Image.Image:
+        """単色ベタ塗りフレームを生成する。"""
+        img = Image.new("RGB", (PHYSICAL_WIDTH, PHYSICAL_HEIGHT), color)
+        if self.screen_w != PHYSICAL_WIDTH or self.screen_h != PHYSICAL_HEIGHT:
+            img = img.resize((self.screen_w, self.screen_h), resample=Image.NEAREST)
+        return img
+    
+    def _show_frame(self):
+        """フェーズに応じてフレームを表示する。"""
+        if self.phase == "start_key":
+            self._show_key_frame(self.KEY_FRAME_START_COLOR, next_phase="data")
+        elif self.phase == "data":
+            self._show_data_frame()
+        elif self.phase == "end_key":
+            self._show_key_frame(self.KEY_FRAME_END_COLOR, next_phase="done")
+        else:
             self.root.after(500, self.root.destroy)
+    
+    def _show_key_frame(self, color: tuple, next_phase: str):
+        """キーフレームを表示する。"""
+        img = self._create_solid_image(color)
+        self.photo = self._ImageTk.PhotoImage(img)
+        self.label.configure(image=self.photo)
+        self.current_key_frame += 1
+        if self.current_key_frame >= self.key_frame_count:
+            self.phase = next_phase
+            self.current_key_frame = 0
+        self.root.after(self.interval_ms, self._show_frame)
+    
+    def _show_data_frame(self):
+        """データフレームを表示する。"""
+        if self.current_data_frame >= self.frame_count:
+            self.phase = "end_key"
+            self.root.after(0, self._show_frame)
             return
         frame_gray, self.offset = generate_frame_array(
             self.gray_stream, self.offset, self.data_indices, self.corner_indices)
@@ -67,11 +109,12 @@ class EncoderApp:
             img = img.resize((self.screen_w, self.screen_h), resample=Image.NEAREST)
         self.photo = self._ImageTk.PhotoImage(img)
         self.label.configure(image=self.photo)
-        self.current_frame += 1
-        self.root.after(self.interval_ms, self.show_next_frame)
+        self.current_data_frame += 1
+        self.root.after(self.interval_ms, self._show_frame)
 
     def run(self):
         self.root.mainloop()
+
 
 
 def main():
