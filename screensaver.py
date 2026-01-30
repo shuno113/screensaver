@@ -24,7 +24,7 @@ import pygame
 from common import (
     PHYSICAL_WIDTH, PHYSICAL_HEIGHT, REPETITIONS,
     precompute_data_indices, configure_block_size, get_frame_params,
-    get_physical_dimensions,
+    get_physical_dimensions, get_logical_dimensions,
 )
 
 
@@ -73,15 +73,18 @@ def generate_frame_from_gray(gray_pixels: np.ndarray,
                               data_indices: np.ndarray, 
                               corner_indices: np.ndarray) -> np.ndarray:
     """グレースケールピクセル配列からフレームを生成する。"""
-    total_pixels = LOGICAL_HEIGHT * LOGICAL_WIDTH
+    logical_width, logical_height = get_logical_dimensions()
+    data_pixels_per_frame, _ = get_frame_params()
+    
+    total_pixels = logical_height * logical_width
     frame_flat = np.zeros(total_pixels, dtype=np.uint8)
     
-    need = min(len(gray_pixels), DATA_PIXELS_PER_FRAME)
+    need = min(len(gray_pixels), data_pixels_per_frame)
     if need > 0:
         frame_flat[data_indices[:need]] = gray_pixels[:need]
     
     frame_flat[corner_indices] = 255
-    return frame_flat.reshape(LOGICAL_HEIGHT, LOGICAL_WIDTH)
+    return frame_flat.reshape(logical_height, logical_width)
 
 
 class StreamingEncoder:
@@ -108,7 +111,8 @@ class StreamingEncoder:
         
         # 動的なバイト/フレーム計算（repetitionsに依存）
         pixels_per_byte = 2 * self.repetitions  # 2 nibbles × repetitions
-        self.bytes_per_frame = DATA_PIXELS_PER_FRAME // pixels_per_byte
+        data_pixels_per_frame, _ = get_frame_params()
+        self.bytes_per_frame = data_pixels_per_frame // pixels_per_byte
         
         # フレーム計算
         self.frame_count = (self.total_size + self.bytes_per_frame - 1) // self.bytes_per_frame
@@ -191,7 +195,8 @@ class FrameProducer(threading.Thread):
     
     def _create_solid_array(self, color: tuple) -> np.ndarray:
         """単色ベタ塗りフレームを生成する（RGB配列）。"""
-        arr = np.zeros((LOGICAL_HEIGHT, LOGICAL_WIDTH, 3), dtype=np.uint8)
+        logical_width, logical_height = get_logical_dimensions()
+        arr = np.zeros((logical_height, logical_width, 3), dtype=np.uint8)
         arr[:, :, 0] = color[0]
         arr[:, :, 1] = color[1]
         arr[:, :, 2] = color[2]
