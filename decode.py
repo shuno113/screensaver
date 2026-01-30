@@ -35,9 +35,9 @@ except ImportError:
     prange = range
 
 from common import (
-    LOGICAL_WIDTH, LOGICAL_HEIGHT,
     precompute_data_indices, gray_to_nibble,
     parse_inner_header, write_unique_file,
+    configure_block_size, get_physical_dimensions, get_logical_dimensions,
 )
 
 
@@ -146,7 +146,8 @@ def get_video_info(video_path: Path) -> Tuple[int, int]:
 # ============================================================
 
 def decode_video_streaming(video_path: Path, output_dir: Path, 
-                           repetitions: int = 1, use_gpu: bool = False) -> Path:
+                           repetitions: int = 1, use_gpu: bool = False,
+                           dedup: bool = True) -> Path:
     """シングルパスでストリーミングデコード。
     
     - 緑キーフレームを検出するまでスキップ
@@ -155,6 +156,9 @@ def decode_video_streaming(video_path: Path, output_dir: Path,
     """
     width, height = get_video_info(video_path)
     frame_size = width * height * 3
+    
+    # 論理解像度を取得（BLOCK_SIZEに依存）
+    logical_width, logical_height = get_logical_dimensions()
     
     data_indices, corner_indices = precompute_data_indices()
     nibbles_per_frame = len(data_indices)
@@ -186,6 +190,10 @@ def decode_video_streaming(video_path: Path, output_dir: Path,
     nibbles_chunks: List[np.ndarray] = []
     processed_frames = 0
     first_logged = False
+    
+    # 重複フレーム検出用
+    prev_nibbles: Optional[np.ndarray] = None
+    dup_count = 0
     
     print(f"[+] Streaming decode: {video_path}")
     print(f"    Frame size: {width}x{height}")
@@ -224,7 +232,7 @@ def decode_video_streaming(video_path: Path, output_dir: Path,
                     break
                 
                 # コーナー輝度チェック
-                gray = resize_with_block_average(arr, LOGICAL_WIDTH, LOGICAL_HEIGHT)
+                gray = resize_with_block_average(arr, logical_width, logical_height)
                 corner_min = gray.ravel()[corner_indices].min()
                 
                 if corner_min >= MIN_CORNER_THRESHOLD:
@@ -240,6 +248,7 @@ def decode_video_streaming(video_path: Path, output_dir: Path,
                     else:
                         nibbles = gray_to_nibble(gray_corrected.ravel()[data_indices])
                     nibbles_chunks.append(nibbles)
+                    prev_nibbles = nibbles.copy()
                     processed_frames += 1
                     first_logged = True
             
@@ -253,7 +262,7 @@ def decode_video_streaming(video_path: Path, output_dir: Path,
                     break
                 
                 # データフレーム処理
-                gray = resize_with_block_average(arr, LOGICAL_WIDTH, LOGICAL_HEIGHT)
+                gray = resize_with_block_average(arr, logical_width, logical_height)
                 corner_min = gray.ravel()[corner_indices].min()
                 
                 if corner_min < MIN_CORNER_THRESHOLD:
@@ -266,12 +275,20 @@ def decode_video_streaming(video_path: Path, output_dir: Path,
                     nibbles = extract_nibbles_numba(gray_corrected, data_indices)
                 else:
                     nibbles = gray_to_nibble(gray_corrected.ravel()[data_indices])
+                
+                # 重複フレーム検出（前フレームと同一ならスキップ）
+                if dedup and prev_nibbles is not None and np.array_equal(nibbles, prev_nibbles):
+                    dup_count += 1
+                    frame_idx += 1
+                    continue
+                
                 nibbles_chunks.append(nibbles)
+                prev_nibbles = nibbles.copy()
                 processed_frames += 1
                 
                 # 進捗表示
                 if processed_frames % 1000 == 0:
-                    print(f"    Processed {processed_frames} frames...")
+                    print(f"    Processed {processed_frames} frames (skipped {dup_count} dups)...")
             
             frame_idx += 1
     
@@ -342,6 +359,8 @@ def main():
     parser.add_argument("-d", "--output-dir", default=".", help="出力ディレクトリ")
     parser.add_argument("--repetitions", type=int, default=1, help="nibbleの繰り返し回数 (デフォルト: 1)")
     parser.add_argument("--gpu", action="store_true", help="GPUデコード (macOS videotoolbox)")
+    parser.add_argument("--no-dedup", action="store_true", help="重複フレーム検出を無効化 (60fps録画時)")
+    parser.add_argument("--block-size", type=int, default=1, help="ブロックサイズ (デフォルト: 1)")
 
     args = parser.parse_args()
 
@@ -353,8 +372,13 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"[+] Config: repetitions={args.repetitions}, gpu={args.gpu}, numba={HAS_NUMBA}")
-    decode_video_streaming(video_path, output_dir, args.repetitions, args.gpu)
+    # ブロックサイズ設定
+    configure_block_size(args.block_size)
+    physical_w, physical_h = get_physical_dimensions()
+    
+    dedup = not args.no_dedup
+    print(f"[+] Config: repetitions={args.repetitions}, gpu={args.gpu}, dedup={dedup}, block_size={args.block_size} ({physical_w}x{physical_h}), numba={HAS_NUMBA}")
+    decode_video_streaming(video_path, output_dir, args.repetitions, args.gpu, dedup)
 
 
 if __name__ == "__main__":

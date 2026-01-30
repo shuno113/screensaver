@@ -17,29 +17,66 @@ import numpy as np
 #  設定値
 # ============================================================
 
-LOGICAL_WIDTH: int = 960
-LOGICAL_HEIGHT: int = 540
-BLOCK_SIZE: int = 2
+# 物理解像度（固定）
+PHYSICAL_WIDTH: int = 1920
+PHYSICAL_HEIGHT: int = 1080
 
-PHYSICAL_WIDTH: int = LOGICAL_WIDTH * BLOCK_SIZE   # 1920
-PHYSICAL_HEIGHT: int = LOGICAL_HEIGHT * BLOCK_SIZE  # 1080
+# ブロックサイズ（デフォルト: 1）
+BLOCK_SIZE: int = 1
 
-CORNER_LOGICAL_COORDS: List[Tuple[int, int]] = [
-    (0, 0),
-    (LOGICAL_WIDTH - 1, 0),
-    (0, LOGICAL_HEIGHT - 1),
-    (LOGICAL_WIDTH - 1, LOGICAL_HEIGHT - 1),
-]
+# 論理解像度（BLOCK_SIZEに依存、get_logical_dimensions()で取得）
+LOGICAL_WIDTH: int = PHYSICAL_WIDTH // BLOCK_SIZE   # 1920 (BLOCK_SIZE=1)
+LOGICAL_HEIGHT: int = PHYSICAL_HEIGHT // BLOCK_SIZE  # 1080 (BLOCK_SIZE=1)
+
+# コーナー座標はget_corner_coords()で動的に取得
+# （BLOCK_SIZE変更時に再計算が必要なため）
 
 NIBBLES_PER_BYTE: int = 2
 REPETITIONS: int = 2
 LOGICAL_PIXELS_PER_BYTE: int = NIBBLES_PER_BYTE * REPETITIONS
 
-DATA_PIXELS_PER_FRAME: int = LOGICAL_WIDTH * LOGICAL_HEIGHT - len(CORNER_LOGICAL_COORDS)
-BYTES_PER_FRAME: int = DATA_PIXELS_PER_FRAME // LOGICAL_PIXELS_PER_BYTE
-
+# DATA_PIXELS_PER_FRAME, BYTES_PER_FRAMEはget_frame_params()で動的に取得
 CORNER_WHITE_THRESHOLD: int = 128
 GROUP_SIZE: int = 2 * REPETITIONS
+
+
+def configure_block_size(block_size: int) -> None:
+    """ブロックサイズを設定し、依存する値を再計算する。"""
+    global BLOCK_SIZE, LOGICAL_WIDTH, LOGICAL_HEIGHT
+    if block_size < 1:
+        raise ValueError("block_size must be >= 1")
+    if PHYSICAL_WIDTH % block_size != 0 or PHYSICAL_HEIGHT % block_size != 0:
+        raise ValueError(f"block_size must evenly divide {PHYSICAL_WIDTH}x{PHYSICAL_HEIGHT}")
+    BLOCK_SIZE = block_size
+    LOGICAL_WIDTH = PHYSICAL_WIDTH // block_size
+    LOGICAL_HEIGHT = PHYSICAL_HEIGHT // block_size
+
+
+def get_logical_dimensions() -> Tuple[int, int]:
+    """現在のBLOCK_SIZEに基づいた論理解像度を取得する。"""
+    return LOGICAL_WIDTH, LOGICAL_HEIGHT
+
+
+def get_physical_dimensions() -> Tuple[int, int]:
+    """物理解像度を取得する（固定値）。"""
+    return PHYSICAL_WIDTH, PHYSICAL_HEIGHT
+
+
+def get_corner_coords() -> List[Tuple[int, int]]:
+    """現在の論理解像度に基づいたコーナー座標を取得する。"""
+    return [
+        (0, 0),
+        (LOGICAL_WIDTH - 1, 0),
+        (0, LOGICAL_HEIGHT - 1),
+        (LOGICAL_WIDTH - 1, LOGICAL_HEIGHT - 1),
+    ]
+
+
+def get_frame_params() -> Tuple[int, int]:
+    """現在の論理解像度に基づいたDATA_PIXELS_PER_FRAME, BYTES_PER_FRAMEを取得する。"""
+    data_pixels = LOGICAL_WIDTH * LOGICAL_HEIGHT - 4  # 4 corners
+    bytes_per_frame = data_pixels // LOGICAL_PIXELS_PER_BYTE
+    return data_pixels, bytes_per_frame
 
 
 # ============================================================

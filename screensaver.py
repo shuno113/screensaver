@@ -22,9 +22,8 @@ import numpy as np
 import pygame
 
 from common import (
-    PHYSICAL_WIDTH, PHYSICAL_HEIGHT, BYTES_PER_FRAME, DATA_PIXELS_PER_FRAME,
-    LOGICAL_WIDTH, LOGICAL_HEIGHT, REPETITIONS,
-    precompute_data_indices,
+    PHYSICAL_WIDTH, PHYSICAL_HEIGHT, REPETITIONS,
+    precompute_data_indices, configure_block_size, get_frame_params,
 )
 
 
@@ -360,6 +359,7 @@ def main():
     parser.add_argument("--countdown", type=int, default=5, help="開始前カウントダウン秒数 (デフォルト: 5)")
     parser.add_argument("--key-duration", type=int, default=3, help="キーフレーム表示秒数 (デフォルト: 3)")
     parser.add_argument("--repetitions", type=int, default=1, help="nibbleの繰り返し回数 (デフォルト: 1)")
+    parser.add_argument("--block-size", type=int, default=1, help="ブロックサイズ (デフォルト: 1)")
 
     args = parser.parse_args()
 
@@ -368,8 +368,13 @@ def main():
         print(f"Error: Input file not found: {input_path}", file=sys.stderr)
         sys.exit(1)
 
+    # ブロックサイズ設定
+    configure_block_size(args.block_size)
+    physical_w, physical_h = get_physical_dimensions()
+
     print(f"[+] Preparing {input_path} ...")
     print(f"    Repetitions: {args.repetitions}")
+    print(f"    Block size: {args.block_size} ({physical_w}x{physical_h})")
     encoder = StreamingEncoder(input_path, repetitions=args.repetitions)
 
     # カウントダウン表示
