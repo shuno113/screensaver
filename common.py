@@ -172,7 +172,8 @@ def precompute_data_indices() -> Tuple[np.ndarray, np.ndarray]:
     """データ格納用インデックスと四隅インデックスを返す。"""
     total = LOGICAL_HEIGHT * LOGICAL_WIDTH
     all_indices = np.arange(total, dtype=np.int32)
-    corner_indices = np.array([cy * LOGICAL_WIDTH + cx for cx, cy in CORNER_LOGICAL_COORDS], dtype=np.int32)
+    corner_coords = get_corner_coords()
+    corner_indices = np.array([cy * LOGICAL_WIDTH + cx for cx, cy in corner_coords], dtype=np.int32)
     mask = np.ones(total, dtype=bool)
     mask[corner_indices] = False
     return all_indices[mask], corner_indices
@@ -181,9 +182,10 @@ def precompute_data_indices() -> Tuple[np.ndarray, np.ndarray]:
 def generate_frame_array(gray_stream: np.ndarray, offset: int,
                          data_indices: np.ndarray, corner_indices: np.ndarray) -> Tuple[np.ndarray, int]:
     """グレースケールフレーム配列を生成する。"""
+    data_pixels_per_frame, _ = get_frame_params()
     total_pixels = LOGICAL_HEIGHT * LOGICAL_WIDTH
     remain = len(gray_stream) - offset
-    need = min(DATA_PIXELS_PER_FRAME, remain) if remain > 0 else 0
+    need = min(data_pixels_per_frame, remain) if remain > 0 else 0
     frame_flat = np.zeros(total_pixels, dtype=np.uint8)
     if need > 0:
         frame_flat[data_indices[:need]] = gray_stream[offset:offset + need]
@@ -193,4 +195,5 @@ def generate_frame_array(gray_stream: np.ndarray, offset: int,
 
 def calculate_frame_count(data_length: int) -> int:
     """データ長からフレーム数を計算する。"""
-    return math.ceil(data_length / BYTES_PER_FRAME)
+    _, bytes_per_frame = get_frame_params()
+    return math.ceil(data_length / bytes_per_frame)
