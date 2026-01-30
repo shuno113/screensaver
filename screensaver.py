@@ -24,6 +24,7 @@ import pygame
 from common import (
     PHYSICAL_WIDTH, PHYSICAL_HEIGHT, REPETITIONS,
     precompute_data_indices, configure_block_size, get_frame_params,
+    get_physical_dimensions,
 )
 
 
