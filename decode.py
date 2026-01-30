@@ -35,9 +35,10 @@ except ImportError:
     prange = range
 
 from common import (
+    HEADER_SIZE,
     precompute_data_indices, gray_to_nibble,
     parse_inner_header, write_unique_file,
-    configure_block_size, get_physical_dimensions, get_logical_dimensions,
+    get_logical_dimensions,
 )
 
 
@@ -146,13 +147,14 @@ def get_video_info(video_path: Path) -> Tuple[int, int]:
 # ============================================================
 
 def decode_video_streaming(video_path: Path, output_dir: Path, 
-                           repetitions: int = 1, use_gpu: bool = False,
+                           use_gpu: bool = False,
                            dedup: bool = True) -> Path:
     """シングルパスでストリーミングデコード。
     
     - 緑キーフレームを検出するまでスキップ
     - データフレームを処理しながらnibbleを蓄積
     - 赤キーフレームを検出したら終了
+    - ヘッダからrepetitions/block_sizeを自動取得
     """
     width, height = get_video_info(video_path)
     frame_size = width * height * 3
@@ -329,17 +331,26 @@ def decode_video_streaming(video_path: Path, output_dir: Path,
     # メモリ解放
     del all_nibbles, groups
     
-    if len(data) < 256:
+    if len(data) < HEADER_SIZE:
         raise ValueError("Data too short")
     
-    file_size, file_hash, filename = parse_inner_header(data[:256])
-    print(f"[+] Header: filename={filename!r}, size={file_size}")
-    file_data = data[256:256 + file_size]
+    # ヘッダ解析（FVD2形式）
+    header_info = parse_inner_header(data[:HEADER_SIZE])
+    print(f"[+] Header (FVD2):")
+    print(f"    Filename: {header_info.filename!r}")
+    print(f"    File size: {header_info.file_size:,} bytes")
+    print(f"    Frame count: {header_info.frame_count}")
+    print(f"    Nibble count: {header_info.nibble_count:,}")
+    print(f"    Repetitions: {header_info.repetitions}")
+    print(f"    Block size: {header_info.block_size}")
+    print(f"    FPS: {header_info.fps}")
     
-    if hashlib.sha256(file_data).digest() != file_hash:
+    file_data = data[HEADER_SIZE:HEADER_SIZE + header_info.file_size]
+    
+    if hashlib.sha256(file_data).digest() != header_info.file_hash:
         raise ValueError("SHA-256 hash mismatch")
     
-    output_path = write_unique_file(output_dir, filename, file_data)
+    output_path = write_unique_file(output_dir, header_info.filename, file_data)
     print(f"[+] Saved: {output_path}")
     return output_path
 
@@ -352,15 +363,13 @@ def main():
         epilog="""
 例:
   python decode.py -i output.mp4
-  python decode.py -i output.mp4 --gpu --repetitions 1
+  python decode.py -i output.mp4 --gpu
 """
     )
     parser.add_argument("-i", "--input", required=True, help="入力動画ファイル")
     parser.add_argument("-d", "--output-dir", default=".", help="出力ディレクトリ")
-    parser.add_argument("--repetitions", type=int, default=1, help="nibbleの繰り返し回数 (デフォルト: 1)")
     parser.add_argument("--gpu", action="store_true", help="GPUデコード (macOS videotoolbox)")
     parser.add_argument("--no-dedup", action="store_true", help="重複フレーム検出を無効化 (60fps録画時)")
-    parser.add_argument("--block-size", type=int, default=1, help="ブロックサイズ (デフォルト: 1)")
 
     args = parser.parse_args()
 
@@ -372,13 +381,9 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # ブロックサイズ設定
-    configure_block_size(args.block_size)
-    physical_w, physical_h = get_physical_dimensions()
-    
     dedup = not args.no_dedup
-    print(f"[+] Config: repetitions={args.repetitions}, gpu={args.gpu}, dedup={dedup}, block_size={args.block_size} ({physical_w}x{physical_h}), numba={HAS_NUMBA}")
-    decode_video_streaming(video_path, output_dir, args.repetitions, args.gpu, dedup)
+    print(f"[+] Config: gpu={args.gpu}, dedup={dedup}, numba={HAS_NUMBA}")
+    decode_video_streaming(video_path, output_dir, args.gpu, dedup)
 
 
 if __name__ == "__main__":

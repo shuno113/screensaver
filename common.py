@@ -7,6 +7,7 @@ screensaver.py と decode.py で共有される設定値、
 """
 import hashlib
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple, List
 
@@ -83,40 +84,109 @@ def get_frame_params() -> Tuple[int, int]:
 #  ヘッダ処理
 # ============================================================
 
-def build_inner_header(file_path: Path, file_bytes: bytes) -> bytes:
-    """256 バイトの内側ヘッダを構築する。"""
-    header = bytearray(256)
-    header[0:4] = b"FVD1"
-    header[4:8] = (256).to_bytes(4, "big")
+# ヘッダフォーマット FVD2 (256バイト):
+#   0-3:     マジック "FVD2"
+#   4-7:     ヘッダサイズ (256)
+#   8-15:    ファイルサイズ (8バイト, big-endian)
+#   16-47:   SHA-256ハッシュ (32バイト)
+#   48:      ファイル名長 (最大180)
+#   49-228:  ファイル名 (UTF-8, 180バイト)
+#   229-232: データフレーム数 (4バイト, big-endian)
+#   233-236: nibble数 (4バイト, big-endian)
+#   237:     Repetitions (1バイト)
+#   238-239: Block size (2バイト, big-endian)
+#   240-241: FPS (2バイト, big-endian)
+#   242-255: 予約 (ゼロ埋め)
+
+MAGIC_FVD2 = b"FVD2"
+HEADER_SIZE = 256
+MAX_FILENAME_LEN = 180
+
+
+@dataclass
+class HeaderInfo:
+    """ヘッダ情報を格納するデータクラス。"""
+    file_size: int
+    file_hash: bytes
+    filename: str
+    frame_count: int
+    nibble_count: int
+    repetitions: int
+    block_size: int
+    fps: int
+
+
+def build_inner_header(
+    file_path: Path,
+    file_bytes: bytes,
+    frame_count: int,
+    nibble_count: int,
+    repetitions: int,
+    block_size: int,
+    fps: int,
+) -> bytes:
+    """256バイトのFVD2ヘッダを構築する。"""
+    header = bytearray(HEADER_SIZE)
+    
+    # マジック & ヘッダサイズ
+    header[0:4] = MAGIC_FVD2
+    header[4:8] = HEADER_SIZE.to_bytes(4, "big")
+    
+    # ファイル情報
     header[8:16] = len(file_bytes).to_bytes(8, "big")
     header[16:48] = hashlib.sha256(file_bytes).digest()
-    name = file_path.name.encode("utf-8")[:200]
+    
+    # ファイル名 (最大180バイト)
+    name = file_path.name.encode("utf-8")[:MAX_FILENAME_LEN]
     header[48] = len(name)
-    header[49:49+len(name)] = name
+    header[49:49 + len(name)] = name
+    
+    # エンコーディングパラメータ
+    header[229:233] = frame_count.to_bytes(4, "big")
+    header[233:237] = nibble_count.to_bytes(4, "big")
+    header[237] = repetitions
+    header[238:240] = block_size.to_bytes(2, "big")
+    header[240:242] = fps.to_bytes(2, "big")
+    
     return bytes(header)
 
 
-def build_plaintext_block(file_path: Path) -> bytes:
-    """平文ブロック = [内側ヘッダ][元ファイル] を構築する。"""
-    data = file_path.read_bytes()
-    return build_inner_header(file_path, data) + data
-
-
-def parse_inner_header(header: bytes) -> Tuple[int, bytes, str]:
-    """256 バイトの内側ヘッダを解析する。"""
-    if len(header) != 256:
-        raise ValueError("Inner header must be exactly 256 bytes")
-    if header[0:4] != b"FVD1":
-        raise ValueError(f"Invalid magic: {header[0:4]!r}")
-    if int.from_bytes(header[4:8], "big") != 256:
+def parse_inner_header(header: bytes) -> HeaderInfo:
+    """256バイトのFVD2ヘッダを解析する。"""
+    if len(header) != HEADER_SIZE:
+        raise ValueError(f"Inner header must be exactly {HEADER_SIZE} bytes")
+    if header[0:4] != MAGIC_FVD2:
+        raise ValueError(f"Invalid magic: {header[0:4]!r} (expected {MAGIC_FVD2!r})")
+    if int.from_bytes(header[4:8], "big") != HEADER_SIZE:
         raise ValueError("Invalid header size")
+    
+    # ファイル情報
     file_size = int.from_bytes(header[8:16], "big")
     file_hash = header[16:48]
+    
+    # ファイル名
     name_len = header[48]
-    if name_len > 200:
+    if name_len > MAX_FILENAME_LEN:
         raise ValueError(f"Invalid name_len: {name_len}")
     filename = header[49:49 + name_len].decode("utf-8", errors="replace")
-    return file_size, file_hash, filename
+    
+    # エンコーディングパラメータ
+    frame_count = int.from_bytes(header[229:233], "big")
+    nibble_count = int.from_bytes(header[233:237], "big")
+    repetitions = header[237]
+    block_size = int.from_bytes(header[238:240], "big")
+    fps = int.from_bytes(header[240:242], "big")
+    
+    return HeaderInfo(
+        file_size=file_size,
+        file_hash=file_hash,
+        filename=filename,
+        frame_count=frame_count,
+        nibble_count=nibble_count,
+        repetitions=repetitions,
+        block_size=block_size,
+        fps=fps,
+    )
 
 
 def write_unique_file(base_dir: Path, filename: str, data: bytes) -> Path:

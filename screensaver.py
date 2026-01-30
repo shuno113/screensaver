@@ -22,31 +22,14 @@ import numpy as np
 import pygame
 
 from common import (
-    PHYSICAL_WIDTH, PHYSICAL_HEIGHT, REPETITIONS,
+    PHYSICAL_WIDTH, PHYSICAL_HEIGHT, REPETITIONS, HEADER_SIZE,
     precompute_data_indices, configure_block_size, get_frame_params,
-    get_physical_dimensions, get_logical_dimensions,
+    get_physical_dimensions, get_logical_dimensions, build_inner_header,
 )
 
 
 # バッファサイズ（フレーム数）
 BUFFER_SIZE = 120
-
-
-# ============================================================
-#  ストリーミングヘッダー生成
-# ============================================================
-
-def build_header_bytes(file_path: Path, file_size: int, file_hash: bytes) -> bytes:
-    """256バイトのヘッダーを生成する。"""
-    header = bytearray(256)
-    header[0:4] = b"FVD1"
-    header[4:8] = (256).to_bytes(4, "big")
-    header[8:16] = file_size.to_bytes(8, "big")
-    header[16:48] = file_hash
-    name = file_path.name.encode("utf-8")[:200]
-    header[48] = len(name)
-    header[49:49+len(name)] = name
-    return bytes(header)
 
 
 # ============================================================
@@ -90,10 +73,12 @@ def generate_frame_from_gray(gray_pixels: np.ndarray,
 class StreamingEncoder:
     """ストリーミング方式でフレームを生成するエンコーダー。"""
     
-    def __init__(self, file_path: Path, repetitions: int = 1):
+    def __init__(self, file_path: Path, repetitions: int = 1, block_size: int = 1, fps: int = 10):
         self.file_path = file_path
         self.file_size = file_path.stat().st_size
         self.repetitions = repetitions
+        self.block_size = block_size
+        self.fps = fps
         
         # ファイルハッシュを計算（ストリーミング）
         print(f"    Calculating hash ...")
@@ -103,19 +88,31 @@ class StreamingEncoder:
                 sha256.update(chunk)
         self.file_hash = sha256.digest()
         
-        # ヘッダー生成
-        self.header = build_header_bytes(file_path, self.file_size, self.file_hash)
-        
-        # 総データサイズ（ヘッダー + ファイル）
-        self.total_size = len(self.header) + self.file_size
-        
         # 動的なバイト/フレーム計算（repetitionsに依存）
         pixels_per_byte = 2 * self.repetitions  # 2 nibbles × repetitions
         data_pixels_per_frame, _ = get_frame_params()
         self.bytes_per_frame = data_pixels_per_frame // pixels_per_byte
         
+        # 総データサイズ（ヘッダー + ファイル）
+        self.total_size = HEADER_SIZE + self.file_size
+        
         # フレーム計算
         self.frame_count = (self.total_size + self.bytes_per_frame - 1) // self.bytes_per_frame
+        
+        # nibble数計算
+        self.nibble_count = self.total_size * 2
+        
+        # ヘッダー生成（ファイル内容を読み込みハッシュ計算済み）
+        file_bytes = file_path.read_bytes()
+        self.header = build_inner_header(
+            file_path=file_path,
+            file_bytes=file_bytes,
+            frame_count=self.frame_count,
+            nibble_count=self.nibble_count,
+            repetitions=self.repetitions,
+            block_size=self.block_size,
+            fps=self.fps,
+        )
         
         # インデックス事前計算
         self.data_indices, self.corner_indices = precompute_data_indices()
@@ -126,6 +123,7 @@ class StreamingEncoder:
         
         print(f"    File size: {self.file_size:,} bytes")
         print(f"    Total frames: {self.frame_count}")
+        print(f"    Nibbles: {self.nibble_count:,}")
     
     def open(self):
         """ファイルを開く。"""
@@ -381,7 +379,12 @@ def main():
     print(f"[+] Preparing {input_path} ...")
     print(f"    Repetitions: {args.repetitions}")
     print(f"    Block size: {args.block_size} ({physical_w}x{physical_h})")
-    encoder = StreamingEncoder(input_path, repetitions=args.repetitions)
+    encoder = StreamingEncoder(
+        input_path, 
+        repetitions=args.repetitions, 
+        block_size=args.block_size, 
+        fps=args.fps
+    )
 
     # カウントダウン表示
     if args.countdown > 0:
