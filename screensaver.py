@@ -12,6 +12,7 @@ import argparse
 import queue
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -176,6 +177,7 @@ def main():
     )
     parser.add_argument("-i", "--input", required=True, help="入力ファイル")
     parser.add_argument("--fps", type=int, default=10, help="フレームレート (デフォルト: 10)")
+    parser.add_argument("--countdown", type=int, default=5, help="開始前カウントダウン秒数 (デフォルト: 5)")
 
     args = parser.parse_args()
 
@@ -187,6 +189,14 @@ def main():
     print(f"[+] Baking {input_path} ...")
     data = build_plaintext_block(input_path)
 
+    # カウントダウン表示
+    if args.countdown > 0:
+        print(f"[+] Starting in {args.countdown} seconds ...")
+        for i in range(args.countdown, 0, -1):
+            print(f"    {i}...", flush=True)
+            time.sleep(1)
+
+    print(f"[+] Starting playback at {args.fps} fps ...")
     EncoderApp(data, args.fps).run()
     print("[+] Baking finished.")
 
