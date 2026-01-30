@@ -272,6 +272,11 @@ class EncoderApp:
             encoder, fps, self.frame_queue, self.screen_w, self.screen_h)
         self.producer.start()
         
+        # FPSモニタリング用
+        self.frame_count = 0
+        self.fps_start_time: Optional[float] = None
+        self.fps_report_interval = 10.0  # 秒
+        
         self.root.after(0, self._show_frame)
     
     def _on_escape(self, event):
@@ -288,8 +293,27 @@ class EncoderApp:
             return
         
         if img is None:
+            # 最終FPS出力
+            if self.fps_start_time is not None and self.frame_count > 0:
+                elapsed = time.time() - self.fps_start_time
+                effective_fps = self.frame_count / elapsed if elapsed > 0 else 0
+                print(f"    Final: {self.frame_count} frames in {elapsed:.1f}s = {effective_fps:.1f} fps")
             self.root.after(500, self.root.destroy)
             return
+        
+        # FPSモニタリング
+        now = time.time()
+        if self.fps_start_time is None:
+            self.fps_start_time = now
+        self.frame_count += 1
+        
+        elapsed = now - self.fps_start_time
+        if elapsed >= self.fps_report_interval:
+            effective_fps = self.frame_count / elapsed
+            print(f"    {self.frame_count} frames in {elapsed:.1f}s = {effective_fps:.1f} fps")
+            # リセット
+            self.fps_start_time = now
+            self.frame_count = 0
         
         self.photo = self._ImageTk.PhotoImage(img)
         self.label.configure(image=self.photo)
