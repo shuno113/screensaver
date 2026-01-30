@@ -7,6 +7,7 @@ screensaver.py と decode.py で共有される設定値、
 """
 import hashlib
 import math
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple, List
@@ -39,6 +40,9 @@ LOGICAL_PIXELS_PER_BYTE: int = NIBBLES_PER_BYTE * REPETITIONS
 # DATA_PIXELS_PER_FRAME, BYTES_PER_FRAMEはget_frame_params()で動的に取得
 CORNER_WHITE_THRESHOLD: int = 128
 GROUP_SIZE: int = 2 * REPETITIONS
+
+# フレームヘッダサイズ（連番4B + CRC32 4B）
+FRAME_HEADER_SIZE: int = 8
 
 
 def configure_block_size(block_size: int) -> None:
@@ -81,7 +85,73 @@ def get_frame_params() -> Tuple[int, int]:
 
 
 # ============================================================
-#  ヘッダ処理
+#  フレームヘッダ処理（連番 + CRC32）
+# ============================================================
+
+class FrameIntegrityError(Exception):
+    """フレームの整合性エラー（フレーム落ちまたは破損）。"""
+    pass
+
+
+def build_frame_header(seq: int, payload: bytes) -> bytes:
+    """フレームヘッダを8バイトで構築する。
+    
+    Args:
+        seq: フレーム連番（0から開始）
+        payload: ペイロードデータ（CRC計算対象）
+    
+    Returns:
+        8バイトのヘッダ: [連番 4B][ペイロードCRC32 4B]
+    """
+    crc = zlib.crc32(payload) & 0xFFFFFFFF
+    return seq.to_bytes(4, "big") + crc.to_bytes(4, "big")
+
+
+def parse_frame_header(data: bytes) -> Tuple[int, int]:
+    """フレームヘッダを解析する。
+    
+    Args:
+        data: 先頭8バイト以上のデータ
+    
+    Returns:
+        (seq, crc): 連番とCRC32値
+    """
+    if len(data) < FRAME_HEADER_SIZE:
+        raise ValueError(f"Data too short for frame header: {len(data)} bytes")
+    seq = int.from_bytes(data[0:4], "big")
+    crc = int.from_bytes(data[4:8], "big")
+    return seq, crc
+
+
+def verify_frame_header(seq: int, crc: int, payload: bytes, expected_seq: int) -> None:
+    """フレームヘッダを検証する。エラー時は例外を投げる。
+    
+    Args:
+        seq: ヘッダから読み取った連番
+        crc: ヘッダから読み取ったCRC32
+        payload: ペイロードデータ
+        expected_seq: 期待される連番
+    
+    Raises:
+        FrameIntegrityError: フレーム落ちまたは破損を検出した場合
+    """
+    # フレーム落ち検出
+    if seq != expected_seq:
+        raise FrameIntegrityError(
+            f"Frame drop detected: expected seq {expected_seq}, got {seq}"
+        )
+    
+    # CRC検証
+    actual_crc = zlib.crc32(payload) & 0xFFFFFFFF
+    if actual_crc != crc:
+        raise FrameIntegrityError(
+            f"Frame corruption detected at seq {seq}: "
+            f"CRC mismatch (expected {crc:08X}, got {actual_crc:08X})"
+        )
+
+
+# ============================================================
+#  ファイルヘッダ処理（FVD2）
 # ============================================================
 
 # ヘッダフォーマット FVD2 (256バイト):

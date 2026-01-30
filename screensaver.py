@@ -22,9 +22,10 @@ import numpy as np
 import pygame
 
 from common import (
-    PHYSICAL_WIDTH, PHYSICAL_HEIGHT, REPETITIONS, HEADER_SIZE,
+    PHYSICAL_WIDTH, PHYSICAL_HEIGHT, REPETITIONS, HEADER_SIZE, FRAME_HEADER_SIZE,
     precompute_data_indices, configure_block_size, get_frame_params,
     get_physical_dimensions, get_logical_dimensions, build_inner_header,
+    build_frame_header,
 )
 
 
@@ -91,20 +92,24 @@ class StreamingEncoder:
         # 動的なバイト/フレーム計算（repetitionsに依存）
         pixels_per_byte = 2 * self.repetitions  # 2 nibbles × repetitions
         data_pixels_per_frame, _ = get_frame_params()
-        self.bytes_per_frame = data_pixels_per_frame // pixels_per_byte
+        raw_bytes_per_frame = data_pixels_per_frame // pixels_per_byte
         
-        # 総データサイズ（ヘッダー + ファイル）
+        # フレームヘッダ分を差し引いたペイロードサイズ
+        self.payload_per_frame = raw_bytes_per_frame - FRAME_HEADER_SIZE
+        self.bytes_per_frame = raw_bytes_per_frame  # フレーム全体（ヘッダ含む）
+        
+        # 総データサイズ（ファイルヘッダー + ファイル）
         self.total_size = HEADER_SIZE + self.file_size
         
-        # フレーム計算
-        self.frame_count = (self.total_size + self.bytes_per_frame - 1) // self.bytes_per_frame
+        # フレーム計算（ペイロードサイズで計算）
+        self.frame_count = (self.total_size + self.payload_per_frame - 1) // self.payload_per_frame
         
-        # nibble数計算
-        self.nibble_count = self.total_size * 2
+        # nibble数計算（フレームヘッダ含む）
+        self.nibble_count = self.frame_count * self.bytes_per_frame * 2
         
-        # ヘッダー生成（ファイル内容を読み込みハッシュ計算済み）
+        # ファイルヘッダー生成（ファイル内容を読み込みハッシュ計算済み）
         file_bytes = file_path.read_bytes()
-        self.header = build_inner_header(
+        self.file_header = build_inner_header(
             file_path=file_path,
             file_bytes=file_bytes,
             frame_count=self.frame_count,
@@ -119,16 +124,19 @@ class StreamingEncoder:
         
         # ファイルハンドル
         self.file_handle: Optional[BinaryIO] = None
-        self.header_offset = 0
+        self.file_header_offset = 0
+        self.frame_seq = 0  # フレーム連番
         
         print(f"    File size: {self.file_size:,} bytes")
         print(f"    Total frames: {self.frame_count}")
+        print(f"    Payload/frame: {self.payload_per_frame} bytes")
         print(f"    Nibbles: {self.nibble_count:,}")
     
     def open(self):
         """ファイルを開く。"""
         self.file_handle = open(self.file_path, 'rb')
-        self.header_offset = 0
+        self.file_header_offset = 0
+        self.frame_seq = 0
     
     def close(self):
         """ファイルを閉じる。"""
@@ -137,24 +145,32 @@ class StreamingEncoder:
             self.file_handle = None
     
     def read_next_chunk(self) -> bytes:
-        """次のフレーム用のデータを読み取る。"""
-        data = bytearray()
-        need = self.bytes_per_frame
+        """次のフレーム用のデータを読み取る（フレームヘッダ付き）。"""
+        payload = bytearray()
+        need = self.payload_per_frame
         
-        # まずヘッダーから読む
-        if self.header_offset < len(self.header):
-            from_header = min(need, len(self.header) - self.header_offset)
-            data.extend(self.header[self.header_offset:self.header_offset + from_header])
-            self.header_offset += from_header
+        # まずファイルヘッダーから読む
+        if self.file_header_offset < len(self.file_header):
+            from_header = min(need, len(self.file_header) - self.file_header_offset)
+            payload.extend(self.file_header[self.file_header_offset:self.file_header_offset + from_header])
+            self.file_header_offset += from_header
             need -= from_header
         
         # 残りはファイルから読む
         if need > 0 and self.file_handle:
             chunk = self.file_handle.read(need)
             if chunk:
-                data.extend(chunk)
+                payload.extend(chunk)
         
-        return bytes(data)
+        if not payload:
+            return b""
+        
+        # フレームヘッダを付加
+        payload_bytes = bytes(payload)
+        frame_header = build_frame_header(self.frame_seq, payload_bytes)
+        self.frame_seq += 1
+        
+        return frame_header + payload_bytes
     
     def generate_next_frame(self) -> Optional[np.ndarray]:
         """次のフレームを生成する。"""

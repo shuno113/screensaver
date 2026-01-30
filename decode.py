@@ -35,10 +35,11 @@ except ImportError:
     prange = range
 
 from common import (
-    HEADER_SIZE,
+    HEADER_SIZE, FRAME_HEADER_SIZE,
     precompute_data_indices, gray_to_nibble,
     parse_inner_header, write_unique_file,
     get_logical_dimensions,
+    parse_frame_header, verify_frame_header, FrameIntegrityError,
 )
 
 
@@ -331,11 +332,51 @@ def decode_video_streaming(video_path: Path, output_dir: Path,
     # メモリ解放
     del all_nibbles, groups
     
-    if len(data) < HEADER_SIZE:
-        raise ValueError("Data too short")
+    print(f"[+] Verifying frame headers ...")
     
-    # ヘッダ解析（FVD2形式）
-    header_info = parse_inner_header(data[:HEADER_SIZE])
+    # フレームヘッダのサイズを計算（repetitionsに依存）
+    # バイト/フレーム = nibbles_per_frame / (2 * repetitions)
+    bytes_per_frame = nibbles_per_frame // (2 * repetitions)
+    payload_per_frame = bytes_per_frame - FRAME_HEADER_SIZE
+    
+    if payload_per_frame <= 0:
+        raise ValueError(f"Invalid payload_per_frame: {payload_per_frame}")
+    
+    # フレーム数計算
+    total_frames = len(data) // bytes_per_frame
+    print(f"    Bytes per frame: {bytes_per_frame}")
+    print(f"    Payload per frame: {payload_per_frame}")
+    print(f"    Total frames to verify: {total_frames}")
+    
+    # フレームごとにヘッダを検証し、ペイロードを抽出
+    payloads = []
+    for i in range(total_frames):
+        frame_start = i * bytes_per_frame
+        frame_data = data[frame_start:frame_start + bytes_per_frame]
+        
+        if len(frame_data) < FRAME_HEADER_SIZE:
+            break
+        
+        # ヘッダ解析
+        seq, crc = parse_frame_header(frame_data)
+        payload = frame_data[FRAME_HEADER_SIZE:]
+        
+        # 検証（エラー時は例外が投げられる）
+        verify_frame_header(seq, crc, payload, expected_seq=i)
+        
+        payloads.append(payload)
+    
+    print(f"    Verified {len(payloads)} frames successfully")
+    
+    # ペイロードを結合
+    file_stream = b"".join(payloads)
+    print(f"    File stream size: {len(file_stream)} bytes")
+    
+    if len(file_stream) < HEADER_SIZE:
+        raise ValueError("File stream too short")
+    
+    # ファイルヘッダ解析（FVD2形式）
+    header_info = parse_inner_header(file_stream[:HEADER_SIZE])
     print(f"[+] Header (FVD2):")
     print(f"    Filename: {header_info.filename!r}")
     print(f"    File size: {header_info.file_size:,} bytes")
@@ -345,7 +386,7 @@ def decode_video_streaming(video_path: Path, output_dir: Path,
     print(f"    Block size: {header_info.block_size}")
     print(f"    FPS: {header_info.fps}")
     
-    file_data = data[HEADER_SIZE:HEADER_SIZE + header_info.file_size]
+    file_data = file_stream[HEADER_SIZE:HEADER_SIZE + header_info.file_size]
     
     if hashlib.sha256(file_data).digest() != header_info.file_hash:
         raise ValueError("SHA-256 hash mismatch")
