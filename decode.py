@@ -1,30 +1,41 @@
 #!/usr/bin/env python3
 """
-Bakery Decode - デコードツール
+Bakery Decode - デコードツール（最適化版）
 
 動画からファイルを復元する。
 
+最適化:
+- シングルパス・ストリーミング処理（メモリ削減・高速化）
+- Numba JIT（ホットパス高速化）
+- GPU デコード対応 (videotoolbox)
+
 使用方法:
     python decode.py -i output.mp4
-    python decode.py -i output.mp4 -d ./output
+    python decode.py -i output.mp4 -d ./output --gpu
 """
 import argparse
 import hashlib
-import io
 import os
 import subprocess
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Tuple, Optional, List
 
 import numpy as np
-from PIL import Image
+
+try:
+    from numba import jit, prange
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    prange = range
 
 from common import (
-    LOGICAL_WIDTH, LOGICAL_HEIGHT, GROUP_SIZE, REPETITIONS,
-    PHYSICAL_WIDTH, PHYSICAL_HEIGHT,
-    CORNER_WHITE_THRESHOLD,
+    LOGICAL_WIDTH, LOGICAL_HEIGHT,
     precompute_data_indices, gray_to_nibble,
     parse_inner_header, write_unique_file,
 )
@@ -34,42 +45,88 @@ from common import (
 #  定数
 # ============================================================
 
-# キーフレーム色閾値
 KEY_FRAME_THRESHOLD_HIGH = 200
 KEY_FRAME_THRESHOLD_LOW = 50
-
-# コーナー探索範囲（ピクセル）
-CORNER_SEARCH_RANGE = 20
-
-# フレーム選択閾値
-MIN_CORNER_THRESHOLD = 180.0
-
-# 並列処理のワーカー数（0 = CPUコア数）
-MAX_WORKERS = 0
+MIN_CORNER_THRESHOLD = 160.0
 
 
 # ============================================================
-#  ユーティリティ
+#  Numba JIT 高速化関数
 # ============================================================
 
-def get_worker_count() -> int:
-    """並列処理のワーカー数を取得する。"""
-    if MAX_WORKERS > 0:
-        return MAX_WORKERS
-    return os.cpu_count() or 4
+@jit(nopython=True, cache=True)
+def rgb_to_gray_numba(rgb: np.ndarray) -> np.ndarray:
+    """RGB配列をグレースケールに変換（Numba版）。"""
+    h, w, _ = rgb.shape
+    gray = np.zeros((h, w), dtype=np.float32)
+    for y in range(h):
+        for x in range(w):
+            gray[y, x] = (float(rgb[y, x, 0]) + float(rgb[y, x, 1]) + float(rgb[y, x, 2])) / 3.0
+    return gray
 
 
-# ============================================================
-#  ffmpeg パイプ処理
-# ============================================================
-
-def run_ffmpeg_pipe_frames(video_path: Path) -> Tuple[List[np.ndarray], int, int]:
-    """ffmpegからパイプで直接フレームを読み込む。
+@jit(nopython=True, cache=True, parallel=True)
+def resize_block_average_numba(gray: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
+    """ブロック平均によるリサイズ（Numba版）。"""
+    src_h, src_w = gray.shape
+    block_h = src_h // target_h
+    block_w = src_w // target_w
     
-    Returns:
-        (フレームリスト, width, height)
-    """
-    # まず動画情報を取得
+    result = np.zeros((target_h, target_w), dtype=np.float32)
+    
+    for ty in prange(target_h):
+        for tx in range(target_w):
+            total = 0.0
+            for by in range(block_h):
+                for bx in range(block_w):
+                    total += gray[ty * block_h + by, tx * block_w + bx]
+            result[ty, tx] = total / (block_h * block_w)
+    
+    return result
+
+
+@jit(nopython=True, cache=True)
+def extract_nibbles_numba(gray_corrected: np.ndarray, data_indices: np.ndarray) -> np.ndarray:
+    """グレースケール配列からnibbleを抽出（Numba版）。"""
+    flat = gray_corrected.ravel()
+    nibbles = np.zeros(len(data_indices), dtype=np.uint8)
+    for i in range(len(data_indices)):
+        val = flat[data_indices[i]]
+        nibbles[i] = np.uint8(min(15, max(0, int(round(float(val) * 15.0 / 255.0)))))
+    return nibbles
+
+
+def resize_with_block_average(arr: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
+    """ブロック平均によるリサイズ。"""
+    if HAS_NUMBA:
+        gray = rgb_to_gray_numba(arr)
+        return resize_block_average_numba(gray, target_height, target_width)
+    else:
+        gray = arr.astype(np.float32).mean(axis=2)
+        src_h, src_w = gray.shape
+        block_h = src_h // target_height
+        block_w = src_w // target_width
+        reshaped = gray[:target_height * block_h, :target_width * block_w]
+        reshaped = reshaped.reshape(target_height, block_h, target_width, block_w)
+        return reshaped.mean(axis=(1, 3))
+
+
+def calibrate_brightness(gray: np.ndarray, corner_indices: np.ndarray) -> np.ndarray:
+    """コーナーマーカーを基準に輝度を補正する。"""
+    flat = gray.ravel()
+    measured_white = flat[corner_indices].max()
+    if measured_white < 50:
+        return np.clip(gray, 0, 255).astype(np.uint8)
+    scale = 255.0 / measured_white
+    return np.clip(gray * scale, 0, 255).astype(np.uint8)
+
+
+# ============================================================
+#  ffmpeg ストリーミング
+# ============================================================
+
+def get_video_info(video_path: Path) -> Tuple[int, int]:
+    """動画の情報を取得する。"""
     probe_cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
@@ -77,296 +134,194 @@ def run_ffmpeg_pipe_frames(video_path: Path) -> Tuple[List[np.ndarray], int, int
         "-of", "csv=p=0",
         str(video_path)
     ]
-    probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
-    if probe_result.returncode != 0:
-        raise RuntimeError(f"ffprobe failed: {probe_result.stderr}")
+    result = subprocess.run(probe_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {result.stderr}")
+    width, height = map(int, result.stdout.strip().split(','))
+    return width, height
+
+
+# ============================================================
+#  シングルパス・ストリーミング処理
+# ============================================================
+
+def decode_video_streaming(video_path: Path, output_dir: Path, 
+                           repetitions: int = 1, use_gpu: bool = False) -> Path:
+    """シングルパスでストリーミングデコード。
     
-    width, height = map(int, probe_result.stdout.strip().split(','))
-    frame_size = width * height * 3  # RGB24
+    - 緑キーフレームを検出するまでスキップ
+    - データフレームを処理しながらnibbleを蓄積
+    - 赤キーフレームを検出したら終了
+    """
+    width, height = get_video_info(video_path)
+    frame_size = width * height * 3
     
-    # ffmpegでrawvideoとして出力
-    cmd = [
-        "ffmpeg", "-i", str(video_path),
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-v", "error",
-        "pipe:1"
-    ]
+    data_indices, corner_indices = precompute_data_indices()
+    nibbles_per_frame = len(data_indices)
+    
+    # ffmpeg起動
+    if use_gpu:
+        cmd = [
+            "ffmpeg", "-hwaccel", "videotoolbox",
+            "-i", str(video_path),
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-v", "error", "pipe:1"
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-i", str(video_path),
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-v", "error", "pipe:1"
+        ]
     
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     
-    frames = []
-    while True:
-        raw = proc.stdout.read(frame_size)
-        if len(raw) < frame_size:
-            break
-        arr = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
-        frames.append(arr)
+    # 状態管理
+    state = "SEEKING_GREEN"  # SEEKING_GREEN -> TRANSITION -> DATA -> DONE
+    frame_idx = 0
+    data_start_idx = None
+    data_end_idx = None
     
-    proc.wait()
-    if proc.returncode != 0:
-        stderr = proc.stderr.read().decode(errors='ignore')
-        raise RuntimeError(f"ffmpeg failed: {stderr}")
+    # nibble蓄積（動的拡張）
+    nibbles_chunks: List[np.ndarray] = []
+    processed_frames = 0
+    first_logged = False
     
-    return frames, width, height
-
-
-# ============================================================
-#  キーフレーム検出
-# ============================================================
-
-def detect_key_frames_from_arrays(frames: List[np.ndarray]) -> Tuple[Optional[int], Optional[int]]:
-    """開始/終了キーフレームのインデックスを検出する（配列版）。
+    print(f"[+] Streaming decode: {video_path}")
+    print(f"    Frame size: {width}x{height}")
     
-    Returns:
-        (start_index, end_index): データ開始/終了フレームのインデックス。
-        キーフレーム自体および遷移フレームは含まない。検出失敗時はNone。
-    """
-    start_idx = None
-    end_idx = None
-    
-    for i, arr in enumerate(frames):
-        arr_f = arr.astype(np.float32)
-        r_mean = arr_f[:, :, 0].mean()
-        g_mean = arr_f[:, :, 1].mean()
-        b_mean = arr_f[:, :, 2].mean()
-        
-        # 緑キーフレーム検出 (開始)
-        if (g_mean > KEY_FRAME_THRESHOLD_HIGH and 
-            r_mean < KEY_FRAME_THRESHOLD_LOW and 
-            b_mean < KEY_FRAME_THRESHOLD_LOW):
-            start_idx = i  # 最後の緑フレームを記録
-        
-        # 赤キーフレーム検出 (終了) - 検出したら即終了
-        elif (r_mean > KEY_FRAME_THRESHOLD_HIGH and 
-              g_mean < KEY_FRAME_THRESHOLD_LOW and 
-              b_mean < KEY_FRAME_THRESHOLD_LOW):
-            if start_idx is not None and end_idx is None:
-                end_idx = i  # 最初の赤フレームを記録
-                break  # 早期終了
-    
-    # データ範囲を返す（キーフレーム自体は除外）
-    if start_idx is not None:
-        start_idx += 1
-        
-        # 遷移フレームをスキップ：コーナーが安定して明るいフレームを探す
-        _, corner_indices = precompute_data_indices()
-        
-        def get_corner_min(idx):
-            gray = resize_with_block_average_from_array(frames[idx], LOGICAL_WIDTH, LOGICAL_HEIGHT)
-            flat = gray.reshape(-1)
-            return flat[corner_indices].min()
-        
-        while start_idx < (end_idx or len(frames)) - 1:
-            corner_min = get_corner_min(start_idx)
-            # コーナーが十分明るければ安定とみなす
-            if corner_min >= 160:
+    try:
+        while True:
+            raw = proc.stdout.read(frame_size)
+            if len(raw) < frame_size:
                 break
-            start_idx += 1
+            
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+            
+            # RGB平均値（高速計算）
+            r_mean = arr[:, :, 0].mean()
+            g_mean = arr[:, :, 1].mean()
+            b_mean = arr[:, :, 2].mean()
+            
+            if state == "SEEKING_GREEN":
+                # 緑キーフレーム検出
+                if (g_mean > KEY_FRAME_THRESHOLD_HIGH and 
+                    r_mean < KEY_FRAME_THRESHOLD_LOW and 
+                    b_mean < KEY_FRAME_THRESHOLD_LOW):
+                    # 緑を見つけた、次フレームから遷移開始
+                    pass
+                elif frame_idx > 0:
+                    # 緑から離れた = 遷移開始
+                    state = "TRANSITION"
+            
+            elif state == "TRANSITION":
+                # 赤キーフレーム検出（早期終了）
+                if (r_mean > KEY_FRAME_THRESHOLD_HIGH and 
+                    g_mean < KEY_FRAME_THRESHOLD_LOW and 
+                    b_mean < KEY_FRAME_THRESHOLD_LOW):
+                    data_end_idx = frame_idx
+                    state = "DONE"
+                    break
+                
+                # コーナー輝度チェック
+                gray = resize_with_block_average(arr, LOGICAL_WIDTH, LOGICAL_HEIGHT)
+                corner_min = gray.ravel()[corner_indices].min()
+                
+                if corner_min >= MIN_CORNER_THRESHOLD:
+                    # 安定したデータフレーム開始
+                    state = "DATA"
+                    data_start_idx = frame_idx
+                    print(f"    Data start: frame {frame_idx}")
+                    
+                    # このフレームも処理
+                    gray_corrected = calibrate_brightness(gray, corner_indices)
+                    if HAS_NUMBA:
+                        nibbles = extract_nibbles_numba(gray_corrected, data_indices)
+                    else:
+                        nibbles = gray_to_nibble(gray_corrected.ravel()[data_indices])
+                    nibbles_chunks.append(nibbles)
+                    processed_frames += 1
+                    first_logged = True
+            
+            elif state == "DATA":
+                # 赤キーフレーム検出（終了）
+                if (r_mean > KEY_FRAME_THRESHOLD_HIGH and 
+                    g_mean < KEY_FRAME_THRESHOLD_LOW and 
+                    b_mean < KEY_FRAME_THRESHOLD_LOW):
+                    data_end_idx = frame_idx
+                    state = "DONE"
+                    break
+                
+                # データフレーム処理
+                gray = resize_with_block_average(arr, LOGICAL_WIDTH, LOGICAL_HEIGHT)
+                corner_min = gray.ravel()[corner_indices].min()
+                
+                if corner_min < MIN_CORNER_THRESHOLD:
+                    # 品質が低いフレームはスキップ
+                    frame_idx += 1
+                    continue
+                
+                gray_corrected = calibrate_brightness(gray, corner_indices)
+                if HAS_NUMBA:
+                    nibbles = extract_nibbles_numba(gray_corrected, data_indices)
+                else:
+                    nibbles = gray_to_nibble(gray_corrected.ravel()[data_indices])
+                nibbles_chunks.append(nibbles)
+                processed_frames += 1
+                
+                # 進捗表示
+                if processed_frames % 1000 == 0:
+                    print(f"    Processed {processed_frames} frames...")
+            
+            frame_idx += 1
     
-    return start_idx, end_idx
-
-
-# ============================================================
-#  リサイズ・輝度補正
-# ============================================================
-
-def resize_with_block_average_from_array(arr: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
-    """ブロック平均によるリサイズ（配列版）。
+    finally:
+        proc.stdout.close()
+        proc.stderr.close()
+        proc.terminate()
+        proc.wait()
     
-    Args:
-        arr: 入力画像配列 (height, width, 3) RGB
-        target_width: 目標幅
-        target_height: 目標高さ
+    if data_start_idx is None:
+        raise ValueError("Start key frame not detected")
     
-    Returns:
-        グレースケール配列 (target_height, target_width) as float32
-    """
-    gray = arr.astype(np.float32).mean(axis=2)  # RGB to grayscale
+    print(f"    Data end: frame {data_end_idx or frame_idx}")
+    print(f"    Total data frames: {processed_frames}")
     
-    src_height, src_width = gray.shape
-    block_h = src_height // target_height
-    block_w = src_width // target_width
+    # nibble結合
+    if not nibbles_chunks:
+        raise ValueError("No data frames extracted")
     
-    # ブロック単位で平均化
-    reshaped = gray[:target_height * block_h, :target_width * block_w]
-    reshaped = reshaped.reshape(target_height, block_h, target_width, block_w)
-    result = reshaped.mean(axis=(1, 3))
-    
-    return result  # float32のまま返す
-
-
-def calibrate_brightness(gray: np.ndarray, corner_indices: np.ndarray) -> np.ndarray:
-    """コーナーマーカーを基準に輝度を補正する。"""
-    flat = gray.reshape(-1)
-    corner_values = flat[corner_indices]
-    
-    measured_white = corner_values.max()
-    
-    if measured_white < 50:
-        return np.clip(gray, 0, 255).astype(np.uint8)
-    
-    scale = 255.0 / measured_white
-    corrected = gray * scale
-    
-    return np.clip(corrected, 0, 255).astype(np.uint8)
-
-
-# ============================================================
-#  並列フレーム処理
-# ============================================================
-
-def _process_single_frame(args: Tuple[int, np.ndarray, np.ndarray]) -> Tuple[int, float, np.ndarray, bytes]:
-    """1フレームを処理する（ワーカー関数）。
-    
-    Args:
-        args: (インデックス, フレーム配列, コーナーインデックス)
-    
-    Returns:
-        (インデックス, 最小コーナー値, グレースケール配列, サンプルハッシュ)
-    """
-    idx, arr, corner_indices = args
-    gray = resize_with_block_average_from_array(arr, LOGICAL_WIDTH, LOGICAL_HEIGHT)
-    flat = gray.reshape(-1)
-    corner_values = flat[corner_indices]
-    min_corner = corner_values.min()
-    data_sample = gray[10:50, 10:50].tobytes()
-    return idx, min_corner, gray, data_sample
-
-
-def select_best_frames_parallel(frames: List[np.ndarray], corner_indices: np.ndarray,
-                                 min_corner_threshold: float = MIN_CORNER_THRESHOLD) -> List[Tuple[int, np.ndarray]]:
-    """録画フレームから最もクリーンなフレームを選択する（並列版）。
-    
-    Args:
-        frames: フレーム配列のリスト
-        corner_indices: コーナーピクセルのインデックス
-        min_corner_threshold: 使用するフレームの最小コーナー値閾値
-    
-    Returns:
-        選択されたフレームインデックスとグレースケール配列のリスト
-    """
-    if not frames:
-        return []
-    
-    n_workers = get_worker_count()
-    
-    # 並列で全フレームを処理
-    frame_data = [None] * len(frames)  # (idx, quality, gray, sample)
-    
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        # ジョブを投入
-        futures = {}
-        for i, arr in enumerate(frames):
-            future = executor.submit(_process_single_frame, (i, arr, corner_indices))
-            futures[future] = i
-        
-        # 結果を収集
-        for future in as_completed(futures):
-            idx, quality, gray, sample = future.result()
-            frame_data[idx] = (idx, quality, gray)
-    
-    # 閾値以上のフレームをすべて選択（グループ化なし）
-    selected = []
-    for idx, quality, gray in frame_data:
-        if quality >= min_corner_threshold:
-            selected.append((idx, gray))
-    
-    return selected
-
-
-def extract_nibbles_from_arrays(frames: List[np.ndarray]) -> np.ndarray:
-    """フレーム配列から nibble 配列を復元する（並列版）。"""
-    data_indices, corner_indices = precompute_data_indices()
-    
-    # フレーム選択（並列処理）
-    selected_frames = select_best_frames_parallel(frames, corner_indices, min_corner_threshold=MIN_CORNER_THRESHOLD)
-    
-    if not selected_frames:
-        print("    Warning: No frames passed quality threshold!")
-        return np.zeros((0,), dtype=np.uint8)
-    
-    print(f"    Selected {len(selected_frames)} clean frames from {len(frames)} total")
-    
-    nibbles_all = []
-    scale_logged = False
-    
-    for idx, gray in selected_frames:
-        # 輝度補正
-        gray_corrected = calibrate_brightness(gray, corner_indices)
-        
-        if not scale_logged:
-            flat = gray.reshape(-1)
-            corner_values = flat[corner_indices]
-            min_corner = corner_values.min()
-            mean_corner = corner_values.mean()
-            print(f"    First clean frame: min_corner = {min_corner:.1f}, mean = {mean_corner:.1f}")
-            if mean_corner < 255:
-                print(f"    Brightness calibration: scale = {255.0/mean_corner:.3f}")
-            scale_logged = True
-        
-        nibbles_all.append(gray_to_nibble(gray_corrected.reshape(-1)[data_indices]))
-    
-    return np.concatenate(nibbles_all) if nibbles_all else np.zeros((0,), dtype=np.uint8)
-
-
-# ============================================================
-#  メイン処理
-# ============================================================
-
-def reconstruct_ciphertext_from_nibbles(nibbles: np.ndarray, repetitions: int = 2) -> bytes:
-    """nibble 列から暗号文を復元する。"""
-    if nibbles.size == 0:
-        return b""
-    group_size = 2 * repetitions
-    usable_len = (nibbles.size // group_size) * group_size
-    if usable_len == 0:
-        return b""
-    groups = nibbles[:usable_len].reshape(-1, group_size)
-    # 平均値 + 0.01 で銀行家丸め（0.5 → 0）を回避し、0.5 → 1 にする
-    hi = np.clip(np.round(groups[:, :repetitions].mean(axis=1) + 0.01), 0, 15).astype(np.uint8)
-    lo = np.clip(np.round(groups[:, repetitions:].mean(axis=1) + 0.01), 0, 15).astype(np.uint8)
-    return bytes(((hi << 4) | lo).astype(np.uint8))
-
-
-def decode_video_to_file(video_path: Path, output_dir: Path, repetitions: int = 2) -> Path:
-    """動画をデコードしてファイルを復元する。"""
-    print(f"[+] Extracting frames from {video_path} ...")
-    frames, width, height = run_ffmpeg_pipe_frames(video_path)
-    print(f"    Extracted {len(frames)} frames ({width}x{height})")
-    
-    print("[+] Detecting key frames ...")
-    start_idx, end_idx = detect_key_frames_from_arrays(frames)
-    if start_idx is None or end_idx is None:
-        raise ValueError("Key frames not detected. Start or end marker is missing.")
-    print(f"    Data frames: {start_idx} to {end_idx - 1} ({end_idx - start_idx} frames)")
-    
-    # キーフレーム間のみ処理
-    data_frames = frames[start_idx:end_idx]
-    
-    # メモリ解放（不要なフレームを削除）
-    del frames
-    
-    print("[+] Extracting nibbles ...")
-    nibbles = extract_nibbles_from_arrays(data_frames)
-    print(f"    Total nibbles: {nibbles.size}")
+    all_nibbles = np.concatenate(nibbles_chunks)
+    print(f"    Total nibbles: {all_nibbles.size}")
     
     # メモリ解放
-    del data_frames
-
+    del nibbles_chunks
+    
+    # バイト復元
     print("[+] Reconstructing data ...")
-    data = reconstruct_ciphertext_from_nibbles(nibbles, repetitions)
+    group_size = 2 * repetitions
+    usable_len = (all_nibbles.size // group_size) * group_size
+    if usable_len == 0:
+        raise ValueError("No usable data")
+    groups = all_nibbles[:usable_len].reshape(-1, group_size)
+    hi = np.clip(np.round(groups[:, :repetitions].mean(axis=1) + 0.01), 0, 15).astype(np.uint8)
+    lo = np.clip(np.round(groups[:, repetitions:].mean(axis=1) + 0.01), 0, 15).astype(np.uint8)
+    data = bytes(((hi << 4) | lo).astype(np.uint8))
     print(f"    Data size: {len(data)} bytes")
-
+    
+    # メモリ解放
+    del all_nibbles, groups
+    
     if len(data) < 256:
         raise ValueError("Data too short")
-
+    
     file_size, file_hash, filename = parse_inner_header(data[:256])
     print(f"[+] Header: filename={filename!r}, size={file_size}")
     file_data = data[256:256 + file_size]
-
+    
     if hashlib.sha256(file_data).digest() != file_hash:
         raise ValueError("SHA-256 hash mismatch")
-
+    
     output_path = write_unique_file(output_dir, filename, file_data)
     print(f"[+] Saved: {output_path}")
     return output_path
@@ -375,17 +330,18 @@ def decode_video_to_file(video_path: Path, output_dir: Path, repetitions: int = 
 def main():
     parser = argparse.ArgumentParser(
         prog="decode",
-        description="動画からファイルを復元する",
+        description="動画からファイルを復元する（最適化版）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 例:
   python decode.py -i output.mp4
-  python decode.py -i output.mp4 -d ./recovered --repetitions 1
+  python decode.py -i output.mp4 --gpu --repetitions 1
 """
     )
     parser.add_argument("-i", "--input", required=True, help="入力動画ファイル")
-    parser.add_argument("-d", "--output-dir", default=".", help="出力ディレクトリ (デフォルト: .)")
+    parser.add_argument("-d", "--output-dir", default=".", help="出力ディレクトリ")
     parser.add_argument("--repetitions", type=int, default=1, help="nibbleの繰り返し回数 (デフォルト: 1)")
+    parser.add_argument("--gpu", action="store_true", help="GPUデコード (macOS videotoolbox)")
 
     args = parser.parse_args()
 
@@ -396,8 +352,9 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[+] Repetitions: {args.repetitions}")
-    decode_video_to_file(video_path, output_dir, args.repetitions)
+    
+    print(f"[+] Config: repetitions={args.repetitions}, gpu={args.gpu}, numba={HAS_NUMBA}")
+    decode_video_streaming(video_path, output_dir, args.repetitions, args.gpu)
 
 
 if __name__ == "__main__":
