@@ -53,7 +53,7 @@ def build_header_bytes(file_path: Path, file_size: int, file_hash: bytes) -> byt
 #  ストリーミングフレーム生成
 # ============================================================
 
-def bytes_to_gray_pixels(data: bytes) -> np.ndarray:
+def bytes_to_gray_pixels(data: bytes, repetitions: int = 1) -> np.ndarray:
     """バイト列をグレースケールピクセル配列に変換する（重複あり）。"""
     if not data:
         return np.zeros((0,), dtype=np.uint8)
@@ -62,8 +62,8 @@ def bytes_to_gray_pixels(data: bytes) -> np.ndarray:
     hi = (arr >> 4) & 0x0F
     lo = arr & 0x0F
     
-    hi_rep = np.repeat(hi[:, None], REPETITIONS, axis=1)
-    lo_rep = np.repeat(lo[:, None], REPETITIONS, axis=1)
+    hi_rep = np.repeat(hi[:, None], repetitions, axis=1)
+    lo_rep = np.repeat(lo[:, None], repetitions, axis=1)
     nibbles = np.concatenate([hi_rep, lo_rep], axis=1).reshape(-1)
     
     return np.round(nibbles.astype(np.float32) * 255.0 / 15.0).astype(np.uint8)
@@ -87,9 +87,10 @@ def generate_frame_from_gray(gray_pixels: np.ndarray,
 class StreamingEncoder:
     """ストリーミング方式でフレームを生成するエンコーダー。"""
     
-    def __init__(self, file_path: Path):
+    def __init__(self, file_path: Path, repetitions: int = 1):
         self.file_path = file_path
         self.file_size = file_path.stat().st_size
+        self.repetitions = repetitions
         
         # ファイルハッシュを計算（ストリーミング）
         print(f"    Calculating hash ...")
@@ -105,8 +106,12 @@ class StreamingEncoder:
         # 総データサイズ（ヘッダー + ファイル）
         self.total_size = len(self.header) + self.file_size
         
+        # 動的なバイト/フレーム計算（repetitionsに依存）
+        pixels_per_byte = 2 * self.repetitions  # 2 nibbles × repetitions
+        self.bytes_per_frame = DATA_PIXELS_PER_FRAME // pixels_per_byte
+        
         # フレーム計算
-        self.frame_count = (self.total_size + BYTES_PER_FRAME - 1) // BYTES_PER_FRAME
+        self.frame_count = (self.total_size + self.bytes_per_frame - 1) // self.bytes_per_frame
         
         # インデックス事前計算
         self.data_indices, self.corner_indices = precompute_data_indices()
@@ -132,7 +137,7 @@ class StreamingEncoder:
     def read_next_chunk(self) -> bytes:
         """次のフレーム用のデータを読み取る。"""
         data = bytearray()
-        need = BYTES_PER_FRAME
+        need = self.bytes_per_frame
         
         # まずヘッダーから読む
         if self.header_offset < len(self.header):
@@ -155,7 +160,7 @@ class StreamingEncoder:
         if not data:
             return None
         
-        gray_pixels = bytes_to_gray_pixels(data)
+        gray_pixels = bytes_to_gray_pixels(data, self.repetitions)
         return generate_frame_from_gray(gray_pixels, self.data_indices, self.corner_indices)
 
 
@@ -240,7 +245,7 @@ class FrameProducer(threading.Thread):
 class PygameApp:
     """pygame フルスクリーン再生アプリ。"""
     
-    def __init__(self, encoder: StreamingEncoder, fps: int):
+    def __init__(self, encoder: StreamingEncoder, fps: int, key_duration_sec: int = 3):
         pygame.init()
         
         # フルスクリーン設定
@@ -257,7 +262,7 @@ class PygameApp:
         # フレームキューとプロデューサーを初期化
         self.frame_queue: queue.Queue[Optional[np.ndarray]] = queue.Queue(maxsize=BUFFER_SIZE)
         self.producer = FrameProducer(
-            encoder, fps, self.frame_queue, self.screen_w, self.screen_h)
+            encoder, fps, self.frame_queue, self.screen_w, self.screen_h, key_duration_sec)
         self.producer.start()
         
         # FPSモニタリング用
@@ -347,12 +352,14 @@ def main():
         epilog="""
 例:
   python screensaver.py -i file.txt
-  python screensaver.py -i file.txt --fps 60
+  python screensaver.py -i file.txt --fps 60 --repetitions 1
 """
     )
     parser.add_argument("-i", "--input", required=True, help="入力ファイル")
     parser.add_argument("--fps", type=int, default=10, help="フレームレート (デフォルト: 10)")
     parser.add_argument("--countdown", type=int, default=5, help="開始前カウントダウン秒数 (デフォルト: 5)")
+    parser.add_argument("--key-duration", type=int, default=3, help="キーフレーム表示秒数 (デフォルト: 3)")
+    parser.add_argument("--repetitions", type=int, default=1, help="nibbleの繰り返し回数 (デフォルト: 1)")
 
     args = parser.parse_args()
 
@@ -362,7 +369,8 @@ def main():
         sys.exit(1)
 
     print(f"[+] Preparing {input_path} ...")
-    encoder = StreamingEncoder(input_path)
+    print(f"    Repetitions: {args.repetitions}")
+    encoder = StreamingEncoder(input_path, repetitions=args.repetitions)
 
     # カウントダウン表示
     if args.countdown > 0:
@@ -371,8 +379,8 @@ def main():
             print(f"    {i}...", flush=True)
             time.sleep(1)
 
-    print(f"[+] Starting playback at {args.fps} fps ...")
-    PygameApp(encoder, args.fps).run()
+    print(f"[+] Starting playback at {args.fps} fps (key frames: {args.key_duration}s) ...")
+    PygameApp(encoder, args.fps, args.key_duration).run()
     print("[+] Playback finished.")
 
 
