@@ -10,9 +10,11 @@ Bakery Decode - デコードツール
 """
 import argparse
 import hashlib
+import io
+import os
 import subprocess
 import sys
-import tempfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Tuple, Optional
 
@@ -21,6 +23,7 @@ from PIL import Image
 
 from common import (
     LOGICAL_WIDTH, LOGICAL_HEIGHT, GROUP_SIZE, REPETITIONS,
+    PHYSICAL_WIDTH, PHYSICAL_HEIGHT,
     CORNER_WHITE_THRESHOLD,
     precompute_data_indices, gray_to_nibble,
     parse_inner_header, write_unique_file,
@@ -28,16 +31,91 @@ from common import (
 
 
 # ============================================================
-#  キーフレーム検出
+#  定数
 # ============================================================
 
 # キーフレーム色閾値
 KEY_FRAME_THRESHOLD_HIGH = 200
 KEY_FRAME_THRESHOLD_LOW = 50
 
+# コーナー探索範囲（ピクセル）
+CORNER_SEARCH_RANGE = 20
 
-def detect_key_frames(frame_files: List[Path]) -> Tuple[Optional[int], Optional[int]]:
-    """開始/終了キーフレームのインデックスを検出する。
+# フレーム選択閾値
+MIN_CORNER_THRESHOLD = 180.0
+
+# 並列処理のワーカー数（0 = CPUコア数）
+MAX_WORKERS = 0
+
+
+# ============================================================
+#  ユーティリティ
+# ============================================================
+
+def get_worker_count() -> int:
+    """並列処理のワーカー数を取得する。"""
+    if MAX_WORKERS > 0:
+        return MAX_WORKERS
+    return os.cpu_count() or 4
+
+
+# ============================================================
+#  ffmpeg パイプ処理
+# ============================================================
+
+def run_ffmpeg_pipe_frames(video_path: Path) -> Tuple[List[np.ndarray], int, int]:
+    """ffmpegからパイプで直接フレームを読み込む。
+    
+    Returns:
+        (フレームリスト, width, height)
+    """
+    # まず動画情報を取得
+    probe_cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "csv=p=0",
+        str(video_path)
+    ]
+    probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+    if probe_result.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {probe_result.stderr}")
+    
+    width, height = map(int, probe_result.stdout.strip().split(','))
+    frame_size = width * height * 3  # RGB24
+    
+    # ffmpegでrawvideoとして出力
+    cmd = [
+        "ffmpeg", "-i", str(video_path),
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-v", "error",
+        "pipe:1"
+    ]
+    
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    frames = []
+    while True:
+        raw = proc.stdout.read(frame_size)
+        if len(raw) < frame_size:
+            break
+        arr = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3)
+        frames.append(arr)
+    
+    proc.wait()
+    if proc.returncode != 0:
+        stderr = proc.stderr.read().decode(errors='ignore')
+        raise RuntimeError(f"ffmpeg failed: {stderr}")
+    
+    return frames, width, height
+
+
+# ============================================================
+#  キーフレーム検出
+# ============================================================
+
+def detect_key_frames_from_arrays(frames: List[np.ndarray]) -> Tuple[Optional[int], Optional[int]]:
+    """開始/終了キーフレームのインデックスを検出する（配列版）。
     
     Returns:
         (start_index, end_index): データ開始/終了フレームのインデックス。
@@ -46,12 +124,11 @@ def detect_key_frames(frame_files: List[Path]) -> Tuple[Optional[int], Optional[
     start_idx = None
     end_idx = None
     
-    for i, frame_path in enumerate(frame_files):
-        img = Image.open(frame_path).convert("RGB")
-        arr = np.array(img, dtype=np.float32)
-        r_mean = arr[:, :, 0].mean()
-        g_mean = arr[:, :, 1].mean()
-        b_mean = arr[:, :, 2].mean()
+    for i, arr in enumerate(frames):
+        arr_f = arr.astype(np.float32)
+        r_mean = arr_f[:, :, 0].mean()
+        g_mean = arr_f[:, :, 1].mean()
+        b_mean = arr_f[:, :, 2].mean()
         
         # 緑キーフレーム検出 (開始)
         if (g_mean > KEY_FRAME_THRESHOLD_HIGH and 
@@ -59,13 +136,13 @@ def detect_key_frames(frame_files: List[Path]) -> Tuple[Optional[int], Optional[
             b_mean < KEY_FRAME_THRESHOLD_LOW):
             start_idx = i  # 最後の緑フレームを記録
         
-        # 赤キーフレーム検出 (終了)
+        # 赤キーフレーム検出 (終了) - 検出したら即終了
         elif (r_mean > KEY_FRAME_THRESHOLD_HIGH and 
               g_mean < KEY_FRAME_THRESHOLD_LOW and 
               b_mean < KEY_FRAME_THRESHOLD_LOW):
             if start_idx is not None and end_idx is None:
                 end_idx = i  # 最初の赤フレームを記録
-                break
+                break  # 早期終了
     
     # データ範囲を返す（キーフレーム自体は除外）
     if start_idx is not None:
@@ -75,14 +152,13 @@ def detect_key_frames(frame_files: List[Path]) -> Tuple[Optional[int], Optional[
         data_indices, corner_indices = precompute_data_indices()
         
         def get_frame_info(idx):
-            img = Image.open(frame_files[idx]).convert("RGB")
-            gray = resize_with_block_average(img, LOGICAL_WIDTH, LOGICAL_HEIGHT)
+            gray = resize_with_block_average_from_array(frames[idx], LOGICAL_WIDTH, LOGICAL_HEIGHT)
             flat = gray.reshape(-1)
             corner_min = flat[corner_indices].min()
             sample = gray[10:50, 10:50].tobytes()
             return corner_min, sample
         
-        while start_idx < (end_idx or len(frame_files)) - 1:
+        while start_idx < (end_idx or len(frames)) - 1:
             curr_corner_min, curr_sample = get_frame_info(start_idx)
             next_corner_min, next_sample = get_frame_info(start_idx + 1)
             
@@ -95,75 +171,21 @@ def detect_key_frames(frame_files: List[Path]) -> Tuple[Optional[int], Optional[
 
 
 # ============================================================
-#  位置補正
+#  リサイズ・輝度補正
 # ============================================================
 
-CORNER_SEARCH_RANGE = 20  # コーナー探索範囲（ピクセル）
-
-
-def detect_corner_offset(gray: np.ndarray) -> Tuple[int, int]:
-    """左上コーナーマーカー（白ピクセル）を検出し、オフセットを返す。
+def resize_with_block_average_from_array(arr: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
+    """ブロック平均によるリサイズ（配列版）。
     
     Args:
-        gray: グレースケール画像配列 (height, width)
-    
-    Returns:
-        (dx, dy): 検出されたオフセット。補正不要または検出失敗時は (0, 0)
-    """
-    # 左上付近で最も白いピクセルを探索
-    search_region = gray[:CORNER_SEARCH_RANGE, :CORNER_SEARCH_RANGE]
-    max_val = search_region.max()
-    
-    if max_val < CORNER_WHITE_THRESHOLD:
-        return 0, 0  # 白ピクセルが見つからない
-    
-    max_pos = np.unravel_index(search_region.argmax(), search_region.shape)
-    dy, dx = max_pos  # numpy の shape は (row, col) = (y, x)
-    
-    return dx, dy
-
-
-def apply_offset_correction(gray: np.ndarray, dx: int, dy: int) -> np.ndarray:
-    """オフセット補正を適用する。"""
-    if dx == 0 and dy == 0:
-        return gray
-    
-    # 負方向にロール（左上に移動）
-    return np.roll(np.roll(gray, -dy, axis=0), -dx, axis=1)
-
-
-# ============================================================
-#  デコード機能
-# ============================================================
-
-def run_ffmpeg_extract_frames(video_path: Path, tmpdir: Path) -> List[Path]:
-    """ffmpeg で動画からフレームを抽出する。"""
-    cmd = ["ffmpeg", "-i", str(video_path), str(tmpdir / "frame_%06d.png")]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {result.stderr.decode(errors='ignore')}")
-    frames = sorted(tmpdir.glob("frame_*.png"))
-    if not frames:
-        raise RuntimeError("No frames extracted")
-    return frames
-
-
-def resize_with_block_average(img: Image.Image, target_width: int, target_height: int) -> np.ndarray:
-    """ブロック平均によるリサイズ。
-    
-    Image.NEAREST はブロック内の1ピクセルのみを選択するため、
-    OBSのフレームキャプチャタイミングずれで値がばらつく問題を回避する。
-    
-    Args:
-        img: 入力画像 (RGB)
+        arr: 入力画像配列 (height, width, 3) RGB
         target_width: 目標幅
         target_height: 目標高さ
     
     Returns:
         グレースケール配列 (target_height, target_width) as float32
     """
-    arr = np.array(img, dtype=np.float32)
-    gray = arr.mean(axis=2)  # RGB to grayscale
+    gray = arr.astype(np.float32).mean(axis=2)  # RGB to grayscale
     
     src_height, src_width = gray.shape
     block_h = src_height // target_height
@@ -178,78 +200,74 @@ def resize_with_block_average(img: Image.Image, target_width: int, target_height
 
 
 def calibrate_brightness(gray: np.ndarray, corner_indices: np.ndarray) -> np.ndarray:
-    """コーナーマーカーを基準に輝度を補正する。
-    
-    コーナーは本来255（白）であるべき。最も明るいコーナーを基準に
-    スケーリング係数を計算し、全体に適用する。
-    
-    Args:
-        gray: グレースケール配列 (height, width) as float32
-        corner_indices: コーナーピクセルのインデックス配列
-    
-    Returns:
-        補正後のグレースケール配列 (uint8)
-    """
+    """コーナーマーカーを基準に輝度を補正する。"""
     flat = gray.reshape(-1)
     corner_values = flat[corner_indices]
     
-    # 最も明るいコーナーを白レベルとして使用
-    # フレーム選択により、少なくとも1つのコーナーは255に近いはず
     measured_white = corner_values.max()
     
     if measured_white < 50:
-        # コーナーが暗すぎる場合は補正を諦める
         return np.clip(gray, 0, 255).astype(np.uint8)
     
-    # スケーリング係数を計算
     scale = 255.0 / measured_white
-    
-    # 補正を適用
     corrected = gray * scale
     
     return np.clip(corrected, 0, 255).astype(np.uint8)
 
 
-def get_frame_corner_quality(img: Image.Image, corner_indices: np.ndarray) -> Tuple[float, np.ndarray]:
-    """フレームのコーナー品質（最小コーナー値）を計算する。
+# ============================================================
+#  並列フレーム処理
+# ============================================================
+
+def _process_single_frame(args: Tuple[int, np.ndarray, np.ndarray]) -> Tuple[int, float, np.ndarray, bytes]:
+    """1フレームを処理する（ワーカー関数）。
+    
+    Args:
+        args: (インデックス, フレーム配列, コーナーインデックス)
     
     Returns:
-        (最小コーナー値, リサイズ後のグレースケール配列)
+        (インデックス, 最小コーナー値, グレースケール配列, サンプルハッシュ)
     """
-    gray = resize_with_block_average(img, LOGICAL_WIDTH, LOGICAL_HEIGHT)
+    idx, arr, corner_indices = args
+    gray = resize_with_block_average_from_array(arr, LOGICAL_WIDTH, LOGICAL_HEIGHT)
     flat = gray.reshape(-1)
     corner_values = flat[corner_indices]
     min_corner = corner_values.min()
-    return min_corner, gray
+    data_sample = gray[10:50, 10:50].tobytes()
+    return idx, min_corner, gray, data_sample
 
 
-def select_best_frames(frame_files: List[Path], corner_indices: np.ndarray,
-                       min_corner_threshold: float = 180.0,
-                       similarity_threshold: float = 0.95) -> List[Tuple[Path, np.ndarray]]:
-    """録画フレームから最もクリーンなフレームを選択する。
-    
-    フレーム内容の類似性に基づいてグループ化し、各グループから最もクリーンなフレームを選択する。
+def select_best_frames_parallel(frames: List[np.ndarray], corner_indices: np.ndarray,
+                                 min_corner_threshold: float = MIN_CORNER_THRESHOLD) -> List[Tuple[int, np.ndarray]]:
+    """録画フレームから最もクリーンなフレームを選択する（並列版）。
     
     Args:
-        frame_files: フレームファイルのリスト
+        frames: フレーム配列のリスト
         corner_indices: コーナーピクセルのインデックス
         min_corner_threshold: 使用するフレームの最小コーナー値閾値
-        similarity_threshold: 同一フレームと判定する相関係数の閾値
     
     Returns:
-        選択されたフレームとそのグレースケール配列のリスト
+        選択されたフレームインデックスとグレースケール配列のリスト
     """
-    if not frame_files:
+    if not frames:
         return []
     
-    # 全フレームを読み込んでコーナー品質を計算
-    frame_data = []  # (path, gray, min_corner, data_hash)
-    for path in frame_files:
-        img = Image.open(path).convert("RGB")
-        quality, gray = get_frame_corner_quality(img, corner_indices)
-        # データ部分のハッシュ（高速な類似性判定用）
-        data_sample = gray[10:50, 10:50].tobytes()  # 中央部分のサンプル
-        frame_data.append((path, gray, quality, data_sample))
+    n_workers = get_worker_count()
+    
+    # 並列で全フレームを処理
+    frame_data = [None] * len(frames)  # (idx, quality, gray, sample)
+    
+    with ProcessPoolExecutor(max_workers=n_workers) as executor:
+        # ジョブを投入
+        futures = {}
+        for i, arr in enumerate(frames):
+            future = executor.submit(_process_single_frame, (i, arr, corner_indices))
+            futures[future] = i
+        
+        # 結果を収集
+        for future in as_completed(futures):
+            idx, quality, gray, sample = future.result()
+            frame_data[idx] = (idx, quality, gray, sample)
     
     # 類似フレームをグループ化し、各グループのベストを選択
     selected = []
@@ -257,13 +275,11 @@ def select_best_frames(frame_files: List[Path], corner_indices: np.ndarray,
     n = len(frame_data)
     
     while i < n:
-        # 現在のフレームと類似しているフレームを集める
         group_start = i
         current_sample = frame_data[i][3]
         
         j = i + 1
         while j < n:
-            # サンプルが同じなら同じ論理フレーム
             if frame_data[j][3] == current_sample:
                 j += 1
             else:
@@ -273,43 +289,40 @@ def select_best_frames(frame_files: List[Path], corner_indices: np.ndarray,
         
         # グループ内で最も品質が高いフレームを選択
         best_idx = group_start
-        best_quality = frame_data[group_start][2]
+        best_quality = frame_data[group_start][1]
         
         for k in range(group_start + 1, group_end):
-            if frame_data[k][2] > best_quality:
-                best_quality = frame_data[k][2]
+            if frame_data[k][1] > best_quality:
+                best_quality = frame_data[k][1]
                 best_idx = k
         
         # 閾値以上なら選択
         if best_quality >= min_corner_threshold:
-            path, gray, _, _ = frame_data[best_idx]
-            selected.append((path, gray))
+            idx, _, gray, _ = frame_data[best_idx]
+            selected.append((idx, gray))
         
         i = group_end
     
     return selected
 
 
-def extract_nibbles_from_frames(frame_files: List[Path]) -> np.ndarray:
-    """フレームから nibble 配列を復元する（フレーム選択＋ブロック平均＋輝度補正）。
-    
-    録画FPSがスクリーンセーバーFPSより高い場合、最もクリーンなフレームを選択して使用する。
-    """
+def extract_nibbles_from_arrays(frames: List[np.ndarray]) -> np.ndarray:
+    """フレーム配列から nibble 配列を復元する（並列版）。"""
     data_indices, corner_indices = precompute_data_indices()
     
-    # フレーム選択（内容ベースのグループ化で最もクリーンなフレームを選択）
-    selected_frames = select_best_frames(frame_files, corner_indices, min_corner_threshold=180.0)
+    # フレーム選択（並列処理）
+    selected_frames = select_best_frames_parallel(frames, corner_indices, min_corner_threshold=MIN_CORNER_THRESHOLD)
     
     if not selected_frames:
         print("    Warning: No frames passed quality threshold!")
         return np.zeros((0,), dtype=np.uint8)
     
-    print(f"    Selected {len(selected_frames)} clean frames from {len(frame_files)} total")
+    print(f"    Selected {len(selected_frames)} clean frames from {len(frames)} total")
     
     nibbles_all = []
     scale_logged = False
     
-    for frame_path, gray in selected_frames:
+    for idx, gray in selected_frames:
         # 輝度補正
         gray_corrected = calibrate_brightness(gray, corner_indices)
         
@@ -328,6 +341,10 @@ def extract_nibbles_from_frames(frame_files: List[Path]) -> np.ndarray:
     return np.concatenate(nibbles_all) if nibbles_all else np.zeros((0,), dtype=np.uint8)
 
 
+# ============================================================
+#  メイン処理
+# ============================================================
+
 def reconstruct_ciphertext_from_nibbles(nibbles: np.ndarray) -> bytes:
     """nibble 列から暗号文を復元する。"""
     if nibbles.size == 0:
@@ -344,24 +361,28 @@ def reconstruct_ciphertext_from_nibbles(nibbles: np.ndarray) -> bytes:
 
 def decode_video_to_file(video_path: Path, output_dir: Path) -> Path:
     """動画をデコードしてファイルを復元する。"""
-    with tempfile.TemporaryDirectory() as tmpdir_str:
-        tmpdir = Path(tmpdir_str)
-        print(f"[+] Extracting frames from {video_path} ...")
-        frame_files = run_ffmpeg_extract_frames(video_path, tmpdir)
-        print(f"    Extracted {len(frame_files)} frames")
-        
-        print("[+] Detecting key frames ...")
-        start_idx, end_idx = detect_key_frames(frame_files)
-        if start_idx is None or end_idx is None:
-            raise ValueError("Key frames not detected. Start or end marker is missing.")
-        print(f"    Data frames: {start_idx} to {end_idx - 1} ({end_idx - start_idx} frames)")
-        
-        # キーフレーム間のみ処理
-        data_frames = frame_files[start_idx:end_idx]
-        
-        print("[+] Extracting nibbles ...")
-        nibbles = extract_nibbles_from_frames(data_frames)
-        print(f"    Total nibbles: {nibbles.size}")
+    print(f"[+] Extracting frames from {video_path} ...")
+    frames, width, height = run_ffmpeg_pipe_frames(video_path)
+    print(f"    Extracted {len(frames)} frames ({width}x{height})")
+    
+    print("[+] Detecting key frames ...")
+    start_idx, end_idx = detect_key_frames_from_arrays(frames)
+    if start_idx is None or end_idx is None:
+        raise ValueError("Key frames not detected. Start or end marker is missing.")
+    print(f"    Data frames: {start_idx} to {end_idx - 1} ({end_idx - start_idx} frames)")
+    
+    # キーフレーム間のみ処理
+    data_frames = frames[start_idx:end_idx]
+    
+    # メモリ解放（不要なフレームを削除）
+    del frames
+    
+    print("[+] Extracting nibbles ...")
+    nibbles = extract_nibbles_from_arrays(data_frames)
+    print(f"    Total nibbles: {nibbles.size}")
+    
+    # メモリ解放
+    del data_frames
 
     print("[+] Reconstructing data ...")
     data = reconstruct_ciphertext_from_nibbles(nibbles)
