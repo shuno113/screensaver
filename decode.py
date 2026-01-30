@@ -148,22 +148,18 @@ def detect_key_frames_from_arrays(frames: List[np.ndarray]) -> Tuple[Optional[in
     if start_idx is not None:
         start_idx += 1
         
-        # 遷移フレームをスキップ：コーナーが安定して明るく、かつ内容が安定しているフレームを探す
-        data_indices, corner_indices = precompute_data_indices()
+        # 遷移フレームをスキップ：コーナーが安定して明るいフレームを探す
+        _, corner_indices = precompute_data_indices()
         
-        def get_frame_info(idx):
+        def get_corner_min(idx):
             gray = resize_with_block_average_from_array(frames[idx], LOGICAL_WIDTH, LOGICAL_HEIGHT)
             flat = gray.reshape(-1)
-            corner_min = flat[corner_indices].min()
-            sample = gray[10:50, 10:50].tobytes()
-            return corner_min, sample
+            return flat[corner_indices].min()
         
         while start_idx < (end_idx or len(frames)) - 1:
-            curr_corner_min, curr_sample = get_frame_info(start_idx)
-            next_corner_min, next_sample = get_frame_info(start_idx + 1)
-            
-            # コーナーが明るく（>=160）、かつ次のフレームと内容が同じなら安定
-            if curr_corner_min >= 160 and curr_sample == next_sample:
+            corner_min = get_corner_min(start_idx)
+            # コーナーが十分明るければ安定とみなす
+            if corner_min >= 160:
                 break
             start_idx += 1
     
@@ -267,41 +263,13 @@ def select_best_frames_parallel(frames: List[np.ndarray], corner_indices: np.nda
         # 結果を収集
         for future in as_completed(futures):
             idx, quality, gray, sample = future.result()
-            frame_data[idx] = (idx, quality, gray, sample)
+            frame_data[idx] = (idx, quality, gray)
     
-    # 類似フレームをグループ化し、各グループのベストを選択
+    # 閾値以上のフレームをすべて選択（グループ化なし）
     selected = []
-    i = 0
-    n = len(frame_data)
-    
-    while i < n:
-        group_start = i
-        current_sample = frame_data[i][3]
-        
-        j = i + 1
-        while j < n:
-            if frame_data[j][3] == current_sample:
-                j += 1
-            else:
-                break
-        
-        group_end = j
-        
-        # グループ内で最も品質が高いフレームを選択
-        best_idx = group_start
-        best_quality = frame_data[group_start][1]
-        
-        for k in range(group_start + 1, group_end):
-            if frame_data[k][1] > best_quality:
-                best_quality = frame_data[k][1]
-                best_idx = k
-        
-        # 閾値以上なら選択
-        if best_quality >= min_corner_threshold:
-            idx, _, gray, _ = frame_data[best_idx]
+    for idx, quality, gray in frame_data:
+        if quality >= min_corner_threshold:
             selected.append((idx, gray))
-        
-        i = group_end
     
     return selected
 
@@ -345,21 +313,22 @@ def extract_nibbles_from_arrays(frames: List[np.ndarray]) -> np.ndarray:
 #  メイン処理
 # ============================================================
 
-def reconstruct_ciphertext_from_nibbles(nibbles: np.ndarray) -> bytes:
+def reconstruct_ciphertext_from_nibbles(nibbles: np.ndarray, repetitions: int = 2) -> bytes:
     """nibble 列から暗号文を復元する。"""
     if nibbles.size == 0:
         return b""
-    usable_len = (nibbles.size // GROUP_SIZE) * GROUP_SIZE
+    group_size = 2 * repetitions
+    usable_len = (nibbles.size // group_size) * group_size
     if usable_len == 0:
         return b""
-    groups = nibbles[:usable_len].reshape(-1, GROUP_SIZE)
+    groups = nibbles[:usable_len].reshape(-1, group_size)
     # 平均値 + 0.01 で銀行家丸め（0.5 → 0）を回避し、0.5 → 1 にする
-    hi = np.clip(np.round(groups[:, :REPETITIONS].mean(axis=1) + 0.01), 0, 15).astype(np.uint8)
-    lo = np.clip(np.round(groups[:, REPETITIONS:].mean(axis=1) + 0.01), 0, 15).astype(np.uint8)
+    hi = np.clip(np.round(groups[:, :repetitions].mean(axis=1) + 0.01), 0, 15).astype(np.uint8)
+    lo = np.clip(np.round(groups[:, repetitions:].mean(axis=1) + 0.01), 0, 15).astype(np.uint8)
     return bytes(((hi << 4) | lo).astype(np.uint8))
 
 
-def decode_video_to_file(video_path: Path, output_dir: Path) -> Path:
+def decode_video_to_file(video_path: Path, output_dir: Path, repetitions: int = 2) -> Path:
     """動画をデコードしてファイルを復元する。"""
     print(f"[+] Extracting frames from {video_path} ...")
     frames, width, height = run_ffmpeg_pipe_frames(video_path)
@@ -385,7 +354,7 @@ def decode_video_to_file(video_path: Path, output_dir: Path) -> Path:
     del data_frames
 
     print("[+] Reconstructing data ...")
-    data = reconstruct_ciphertext_from_nibbles(nibbles)
+    data = reconstruct_ciphertext_from_nibbles(nibbles, repetitions)
     print(f"    Data size: {len(data)} bytes")
 
     if len(data) < 256:
@@ -411,11 +380,12 @@ def main():
         epilog="""
 例:
   python decode.py -i output.mp4
-  python decode.py -i output.mp4 -d ./recovered
+  python decode.py -i output.mp4 -d ./recovered --repetitions 1
 """
     )
     parser.add_argument("-i", "--input", required=True, help="入力動画ファイル")
     parser.add_argument("-d", "--output-dir", default=".", help="出力ディレクトリ (デフォルト: .)")
+    parser.add_argument("--repetitions", type=int, default=1, help="nibbleの繰り返し回数 (デフォルト: 1)")
 
     args = parser.parse_args()
 
@@ -426,7 +396,8 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    decode_video_to_file(video_path, output_dir)
+    print(f"[+] Repetitions: {args.repetitions}")
+    decode_video_to_file(video_path, output_dir, args.repetitions)
 
 
 if __name__ == "__main__":
